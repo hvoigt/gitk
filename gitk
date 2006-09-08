@@ -405,7 +405,7 @@ proc makewindow {} {
     global findtype findtypemenu findloc findstring fstring geometry
     global entries sha1entry sha1string sha1but
     global maincursor textcursor curtextcursor
-    global rowctxmenu mergemax wrapcomment
+    global rowctxmenu fakerowmenu mergemax wrapcomment
     global highlight_files gdttype
     global searchstring sstring
     global bgcolor fgcolor bglist fglist diffcolors
@@ -730,6 +730,17 @@ proc makewindow {} {
     $rowctxmenu add command -label "Create new branch" -command mkbranch
     $rowctxmenu add command -label "Cherry-pick this commit" \
 	-command cherrypick
+
+    set fakerowmenu .fakerowmenu
+    menu $fakerowmenu -tearoff 0
+    $fakerowmenu add command -label "Diff this -> selected" \
+	-command {diffvssel 0}
+    $fakerowmenu add command -label "Diff selected -> this" \
+	-command {diffvssel 1}
+    $fakerowmenu add command -label "Make patch" -command mkpatch
+#    $fakerowmenu add command -label "Commit" -command {mkcommit 0}
+#    $fakerowmenu add command -label "Commit all" -command {mkcommit 1}
+#    $fakerowmenu add command -label "Revert local changes" -command revertlocal
 
     set headctxmenu .headctxmenu
     menu $headctxmenu -tearoff 0
@@ -2460,20 +2471,48 @@ proc showstuff {canshow last} {
     }
     if {$lookingforhead && [info exists commitrow($curview,$mainheadid)]
 	&& ($last || $commitrow($curview,$mainheadid) < $numcommits - 1)} {
-	# spawn off a process to do git diff-index HEAD
-	global localdiff localrow
-	set localdiff {}
-	set localrow -1
 	set lookingforhead 0
-	set fd [open "|git diff-index HEAD" r]
-	fconfigure $fd -blocking 0
-	fileevent $fd readable [list readdiffindex $fd]
+	dodiffindex
     }
 }
 
-proc readdiffindex {fd} {
+proc doshowlocalchanges {} {
+    global lookingforhead curview mainheadid phase commitrow
+
+    if {[info exists commitrow($curview,$mainheadid)] &&
+	($phase eq {} || $commitrow($curview,$mainheadid) < $numcommits - 1)} {
+	dodiffindex
+    } elseif {$phase ne {}} {
+	set lookingforhead 1
+    }
+}
+
+proc dohidelocalchanges {} {
+    global lookingforhead localrow lserial
+
+    set lookingforhead 0
+    if {$localrow >= 0} {
+	removerow $localrow
+	set localrow -1
+    }
+    incr lserial
+}
+
+# spawn off a process to do git diff-index HEAD
+proc dodiffindex {} {
+    global localdiff localrow lserial
+
+    incr lserial
+    set localdiff {}
+    set localrow -1
+    set fd [open "|git diff-index HEAD" r]
+    fconfigure $fd -blocking 0
+    fileevent $fd readable [list readdiffindex $fd $lserial]
+}
+
+proc readdiffindex {fd serial} {
     global localdiff localrow commitrow mainheadid nullid curview
-    global commitinfo
+    global commitinfo lserial
 
     while {[gets $fd line] >= 0} {
 	set tl [split $line "\t"]
@@ -2481,12 +2520,14 @@ proc readdiffindex {fd} {
 	    puts "bad line from readdiffindex: $line"
 	    continue
 	}
-	lappend localdiff $tl
+	if {$serial == $lserial} {
+	    lappend localdiff $tl
+	}
     }
     if {[eof $fd]} {
 	close $fd
     }
-    if {$localdiff ne {} && $localrow == -1} {
+    if {$serial == $lserial && $localdiff ne {} && $localrow == -1} {
 	# add the line for the local diff to the graph
 	set localrow $commitrow($curview,$mainheadid)
 	set hl "Local uncommitted changes"
@@ -3463,6 +3504,99 @@ proc insertrow {row newcmit} {
 
     if {[info exists selectedline] && $selectedline >= $row} {
 	incr selectedline
+    }
+    redisplay
+}
+
+# Remove a commit that was inserted with insertrow on row $row.
+proc removerow {row} {
+    global displayorder parentlist childlist commitlisted children
+    global commitrow curview rowidlist rowoffsets numcommits
+    global rowrangelist idrowranges rowlaidout rowoptim numcommits
+    global linesegends selectedline rowchk commitidx
+
+    if {$row >= $numcommits} {
+	puts "oops, removing row $row but only have $numcommits rows"
+	return
+    }
+    set rp1 [expr {$row + 1}]
+    set id [lindex $displayorder $row]
+    set p [lindex $parentlist $row]
+    set displayorder [lreplace $displayorder $row $row]
+    set parentlist [lreplace $parentlist $row $row]
+    set childlist [lreplace $childlist $row $row]
+    set commitlisted [lreplace $commitlisted $row $row]
+    set kids [lindex $childlist $row]
+    set i [lsearch -exact $kids $id]
+    if {$i >= 0} {
+	set kids [lreplace $kids $i $i]
+	lset childlist $row $kids
+	set children($curview,$p) $kids
+    }
+    set l [llength $displayorder]
+    for {set r $row} {$r < $l} {incr r} {
+	set id [lindex $displayorder $r]
+	set commitrow($curview,$id) $r
+    }
+    incr commitidx($curview) -1
+
+    set rowidlist [lreplace $rowidlist $row $row]
+    set rowoffsets [lreplace $rowoffsets $rp1 $rp1]
+    if {$kids ne {}} {
+	set offs [lindex $rowoffsets $row]
+	set offs [lreplace $offs end end]
+	lset rowoffsets $row $offs
+    }
+
+    set rowrangelist [lreplace $rowrangelist $row $row]
+    set l [llength $rowrangelist]
+    for {set r 0} {$r < $l} {incr r} {
+	set ranges [lindex $rowrangelist $r]
+	if {$ranges ne {} && [lindex $ranges end] > $row} {
+	    set newranges {}
+	    foreach x $ranges {
+		if {$x > $row} {
+		    lappend newranges [expr {$x - 1}]
+		} else {
+		    lappend newranges $x
+		}
+	    }
+	    lset rowrangelist $r $newranges
+	}
+    }
+    if {[llength $kids] > 0} {
+	set ranges [lindex $rowrangelist $row]
+	while {$ranges ne {} &&
+	       [lindex $ranges end-1] == [lindex $ranges end]} {
+	    set ranges [lreplace $ranges end-1 end]
+	}
+	lset rowrangelist $row $ranges
+    }
+
+    foreach id [array names idrowranges] {
+	set ranges $idrowranges($id)
+	if {$ranges ne {} && [lindex $ranges end] > $row} {
+	    set newranges {}
+	    foreach x $ranges {
+		if {$x > $row} {
+		    lappend newranges [expr {$x - 1}]
+		} else {
+		    lappend newranges $x
+		}
+	    }
+	    set idrowranges($id) $newranges
+	}
+    }
+
+    set linesegends [lreplace $linesegends $row $row]
+    catch {unset rowchk}
+
+    incr rowlaidout -1
+    incr rowoptim -1
+    incr numcommits -1
+
+    if {[info exists selectedline] && $selectedline > $row} {
+	incr selectedline -1
     }
     redisplay
 }
@@ -4966,28 +5100,25 @@ proc mstime {} {
 }
 
 proc rowmenu {x y id} {
-    global rowctxmenu commitrow selectedline rowmenuid curview nullid
+    global rowctxmenu commitrow selectedline rowmenuid curview
+    global nullid fakerowmenu
 
+    set rowmenuid $id
     if {![info exists selectedline]
 	|| $commitrow($curview,$id) eq $selectedline} {
 	set state disabled
     } else {
 	set state normal
     }
-    $rowctxmenu entryconfigure 0 -state $state
-    $rowctxmenu entryconfigure 1 -state $state
-    $rowctxmenu entryconfigure 2 -state $state
-    set rowmenuid $id
-    if {$id eq $nullid} {
-	set state disabled
+    if {$id ne $nullid} {
+	set menu $rowctxmenu
     } else {
-	set state normal
+	set menu $fakerowmenu
     }
-    $rowctxmenu entryconfigure 3 -state $state
-    $rowctxmenu entryconfigure 4 -state $state
-    $rowctxmenu entryconfigure 5 -state $state
-    $rowctxmenu entryconfigure 6 -state $state
-    tk_popup $rowctxmenu $x $y
+    $menu entryconfigure 0 -state $state
+    $menu entryconfigure 1 -state $state
+    $menu entryconfigure 2 -state $state
+    tk_popup $menu $x $y
 }
 
 proc diffvssel {dirn} {
@@ -5380,11 +5511,16 @@ proc headmenu {x y id head} {
 
 proc cobranch {} {
     global headmenuid headmenuhead mainhead headids
+    global showlocalchanges localrow mainheadid
 
     # check the tree is clean first??
     set oldmainhead $mainhead
     nowbusy checkout
     update
+    if {$localrow >= 0} {
+	removerow $localrow
+	set localrow -1
+    }
     if {[catch {
 	exec git checkout $headmenuhead
     } err]} {
@@ -5393,10 +5529,14 @@ proc cobranch {} {
     } else {
 	notbusy checkout
 	set mainhead $headmenuhead
+	set mainheadid $headmenuid
 	if {[info exists headids($oldmainhead)]} {
 	    redrawtags $headids($oldmainhead)
 	}
 	redrawtags $headmenuid
+	if {$showlocalchanges} {
+	    dodiffindex
+	}
     }
 }
 
@@ -5999,8 +6139,13 @@ proc prefsok {} {
     catch {destroy $prefstop}
     unset prefstop
     if {$showlocalchanges != $oldprefs(showlocalchanges)} {
-	after idle updatecommits
-    } elseif {$maxwidth != $oldprefs(maxwidth)
+	if {$showlocalchanges} {
+	    doshowlocalchanges
+	} else {
+	    dohidelocalchanges
+	}
+    }
+    if {$maxwidth != $oldprefs(maxwidth)
 	|| $maxgraphpct != $oldprefs(maxgraphpct)} {
 	redisplay
     } elseif {$showneartags != $oldprefs(showneartags)} {
@@ -6396,6 +6541,9 @@ set cmdlineok 0
 set stopped 0
 set stuffsaved 0
 set patchnum 0
+set lookingforhead 0
+set localrow -1
+set lserial 0
 setcoords
 makewindow
 readrefs
