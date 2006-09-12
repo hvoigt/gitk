@@ -2662,7 +2662,7 @@ proc dodiffindex {} {
 
 proc readdiffindex {fd serial} {
     global localdiff localrow commitrow mainheadid nullid curview
-    global commitinfo lserial
+    global commitinfo commitdata lserial
 
     while {[gets $fd line] >= 0} {
 	set tl [split $line "\t"]
@@ -2682,6 +2682,7 @@ proc readdiffindex {fd serial} {
 	set localrow $commitrow($curview,$mainheadid)
 	set hl "Local uncommitted changes"
 	set commitinfo($nullid) [list  $hl {} {} {} {} "    $hl\n"]
+	set commitdata($nullid) "\n    $hl\n"
 	insertrow $localrow $nullid
     }
 }
@@ -3795,13 +3796,13 @@ proc notbusy {what} {
 
 proc drawrest {} {
     global startmsecs
-    global rowlaidout commitidx curview
+    global rowlaidout commitidx curview rowoptim
     global pending_select
 
     set row $rowlaidout
     layoutrows $rowlaidout $commitidx($curview) 1
     layouttail
-    optimize_rows $row 0 $commitidx($curview)
+    optimize_rows $rowoptim 0 $commitidx($curview)
     showstuff $commitidx($curview) 1
     if {[info exists pending_select]} {
 	selectline 0 1
