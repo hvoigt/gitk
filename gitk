@@ -3403,10 +3403,13 @@ proc assigncolor {id} {
 
     if {[info exists colormap($id)]} return
     set ncolors [llength $colors]
+    set kids {}
     if {[info exists children($curview,$id)]} {
-	set kids $children($curview,$id)
-    } else {
-	set kids {}
+	foreach child $children($curview,$id) {
+	    if {[info exists commitrow($curview,$child)]} {
+		lappend kids $child
+	    }
+	}
     }
     if {[llength $kids] == 1} {
 	set child [lindex $kids 0]
