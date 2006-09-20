@@ -16,8 +16,71 @@ proc gitdir {} {
     }
 }
 
+# A simple scheduler for compute-intensive stuff.
+# The aim is to make sure that event handlers for GUI actions can
+# run at least every 50-100 ms.  Unfortunately fileevent handlers are
+# run before X event handlers, so reading from a fast source can
+# make the GUI completely unresponsive.
+proc run args {
+    global isonrunq runq
+
+    set script $args
+    if {[info exists isonrunq($script)]} return
+    if {$runq eq {}} {
+	after idle dorunq
+    }
+    lappend runq [list {} $script]
+    set isonrunq($script) 1
+}
+
+proc filerun {fd script} {
+    fileevent $fd readable [list filereadable $fd $script]
+}
+
+proc filereadable {fd script} {
+    global runq
+
+    fileevent $fd readable {}
+    if {$runq eq {}} {
+	after idle dorunq
+    }
+    lappend runq [list $fd $script]
+}
+
+proc dorunq {} {
+    global isonrunq runq
+
+    set tstart [clock clicks -milliseconds]
+    set t0 $tstart
+    while {$runq ne {}} {
+	set fd [lindex $runq 0 0]
+	set script [lindex $runq 0 1]
+	set repeat [eval $script]
+	set t1 [clock clicks -milliseconds]
+	set t [expr {$t1 - $t0}]
+	set runq [lrange $runq 1 end]
+	if {$repeat ne {} && $repeat} {
+	    if {$fd eq {} || $repeat == 2} {
+		# script returns 1 if it wants to be readded
+		# file readers return 2 if they could do more straight away
+		lappend runq [list $fd $script]
+	    } else {
+		fileevent $fd readable [list filereadable $fd $script]
+	    }
+	} elseif {$fd eq {}} {
+	    unset isonrunq($script)
+	}
+	set t0 $t1
+	if {$t1 - $tstart >= 80} break
+    }
+    if {$runq ne {}} {
+	after idle dorunq
+    }
+}
+
+# Start off a git rev-list process and arrange to read its output
 proc start_rev_list {view} {
-    global startmsecs nextupdate misordered curview
+    global startmsecs misordered curview
     global commfd leftover tclencoding datemode
     global viewargs viewfiles commitidx reorderbuf
     global lookingforhead showlocalchanges
@@ -25,7 +88,6 @@ proc start_rev_list {view} {
     global vdisporder vparentlist vcmitlisted
 
     set startmsecs [clock clicks -milliseconds]
-    set nextupdate [expr {$startmsecs + 100}]
     if {$view == $curview} {
 	set displayorder {}
 	set parentlist {}
@@ -60,7 +122,7 @@ proc start_rev_list {view} {
     if {$tclencoding != {}} {
 	fconfigure $fd -encoding $tclencoding
     }
-    fileevent $fd readable [list getcommitlines $fd $view]
+    filerun $fd [list getcommitlines $fd $view]
     nowbusy $view
 }
 
@@ -182,14 +244,16 @@ proc topo_sort {l} {
 
 # called when input from the git rev-list process is available
 proc getcommitlines {fd view}  {
-    global nextupdate leftover commfd reorderbuf reorder_delay
+    global leftover commfd reorderbuf reorder_delay
     global commitrow commitdata misordered
     global children curview hlview rowlaidout
 
     set rebuf $reorderbuf($view)
     set stuff [read $fd 500000]
     if {$stuff == {}} {
-	if {![eof $fd]} return
+	if {![eof $fd]} {
+	    return 1
+	}
 	global viewname
 	flushreorder $rebuf $view [llength $rebuf]
 	unset commfd($view)
@@ -215,9 +279,9 @@ proc getcommitlines {fd view}  {
 	    error_popup $err
 	}
 	if {$view == $curview} {
-	    after idle finishcommits
+	    run chewcommits $view
 	}
-	return
+	return 0
     }
     set i 0
     foreach x $rebuf {
@@ -336,32 +400,56 @@ proc getcommitlines {fd view}  {
     }
     if {$gotsome} {
 	flushreorder $rebuf $view [expr {[llength $rebuf] - $reorder_delay}]
-	if {$view == $curview} {
-	    if {!$misordered($view)} {
-		while {[layoutmore $nextupdate]} doupdate
-	    }
-	}
-	if {[info exists hlview] && $view == $hlview} {
-	    vhighlightmore
-	}
+	run chewcommits $view
     }
-    if {[clock clicks -milliseconds] >= $nextupdate} {
-	doupdate
-    }
+    return 2
 }
 
-proc doupdate {} {
-    global commfd nextupdate
+proc chewcommits {view} {
+    global curview misordered hlview commfd
+    global selectedline pending_select
 
-    foreach v [array names commfd] {
-	fileevent $commfd($v) readable {}
+    set more 0
+    if {$view == $curview} {
+	set allread [expr {![info exists commfd($view)]}]
+	set tlimit [expr {[clock clicks -milliseconds] + 50}]
+	if {$allread && $misordered($view)} {
+	    # misordering was detected that we couldn't fix in the reorder
+	    # buffer; re-do the layout from scratch
+	    if {[info exists selectedline]} {
+		set pending_select $currentid
+		unset selectedline
+	    }
+	    # note show_status does clear_display
+	    show_status "Redoing layout due to misordered commits"
+	    initlayout
+	    set misordered($curview) 0
+	}
+	if {!$misordered($view)} {
+	    set more [layoutmore $tlimit $allread]
+	    if {$allread && !$more} {
+		global displayorder nullid commitidx phase
+		global numcommits startmsecs
+
+		if {[info exists pending_select]} {
+		    set row [expr {[lindex $displayorder 0] eq $nullid}]
+		    selectline $row 1
+		}
+		if {$commitidx($curview) > 0} {
+		    #set ms [expr {[clock clicks -milliseconds] - $startmsecs}]
+		    #puts "overall $ms ms for $numcommits commits"
+		} else {
+		    show_status "No commits selected"
+		}
+		notbusy layout
+		set phase {}
+	    }
+	}
     }
-    update
-    set nextupdate [expr {[clock clicks -milliseconds] + 100}]
-    foreach v [array names commfd] {
-	set fd $commfd($v)
-	fileevent $fd readable [list getcommitlines $fd $v]
+    if {[info exists hlview] && $view == $hlview} {
+	vhighlightmore
     }
+    return $more
 }
 
 proc readcommit {id} {
@@ -1674,9 +1762,9 @@ proc newviewok {top n} {
 	set viewargs($n) $newargs
 	addviewmenu $n
 	if {!$newishighlight} {
-	    after idle showview $n
+	    run showview $n
 	} else {
-	    after idle addvhighlight $n
+	    run addvhighlight $n
 	}
     } else {
 	# editing an existing view
@@ -1692,7 +1780,7 @@ proc newviewok {top n} {
 	    set viewfiles($n) $files
 	    set viewargs($n) $newargs
 	    if {$curview == $n} {
-		after idle updatecommits
+		run updatecommits
 	    }
 	}
     }
@@ -1750,7 +1838,7 @@ proc showview {n} {
     global matchinglines treediffs
     global pending_select phase misordered
     global commitidx rowlaidout rowoptim linesegends
-    global commfd nextupdate
+    global commfd
     global selectedview nullid selectfirst
     global vparentlist vdisporder vcmitlisted
     global hlview selectedhlview
@@ -1871,13 +1959,7 @@ proc showview {n} {
 	if {$phase eq "getcommits"} {
 	    show_status "Reading commits..."
 	}
-	if {[info exists commfd($n)]} {
-	    if {!$misordered($n)} {
-		layoutmore {}
-	    }
-	} else {
-	    finishcommits
-	}
+	run chewcommits $n
     } elseif {$numcommits == 0} {
 	show_status "No commits selected"
     }
@@ -2061,7 +2143,7 @@ proc do_file_hl {serial} {
     set cmd [concat | git-diff-tree -r -s --stdin $gdtargs]
     set filehighlight [open $cmd r+]
     fconfigure $filehighlight -blocking 0
-    fileevent $filehighlight readable readfhighlight
+    filerun $filehighlight readfhighlight
     set fhl_list {}
     drawvisible
     flushhighlights
@@ -2089,7 +2171,11 @@ proc readfhighlight {} {
     global filehighlight fhighlights commitrow curview mainfont iddrawn
     global fhl_list
 
-    while {[gets $filehighlight line] >= 0} {
+    if {![info exists filehighlight]} {
+	return 0
+    }
+    set nr 0
+    while {[incr nr] <= 100 && [gets $filehighlight line] >= 0} {
 	set line [string trim $line]
 	set i [lsearch -exact $fhl_list $line]
 	if {$i < 0} continue
@@ -2113,8 +2199,10 @@ proc readfhighlight {} {
 	puts "oops, git-diff-tree died"
 	catch {close $filehighlight}
 	unset filehighlight
+	return 0
     }
     next_hlcont
+    return 1
 }
 
 proc find_change {name ix op} {
@@ -2181,7 +2269,7 @@ proc vrel_change {name ix op} {
 
     rhighlight_none
     if {$highlight_related ne "None"} {
-	after idle drawvisible
+	run drawvisible
     }
 }
 
@@ -2196,7 +2284,7 @@ proc rhighlight_sel {a} {
     set anc_todo [list $a]
     if {$highlight_related ne "None"} {
 	rhighlight_none
-	after idle drawvisible
+	run drawvisible
     }
 }
 
@@ -2557,15 +2645,18 @@ proc visiblerows {} {
     return [list $r0 $r1]
 }
 
-proc layoutmore {tmax} {
+proc layoutmore {tmax allread} {
     global rowlaidout rowoptim commitidx numcommits optim_delay
-    global uparrowlen curview
+    global uparrowlen curview rowidlist idinlist
 
+    set showlast 0
+    set showdelay $optim_delay
+    set optdelay [expr {$uparrowlen + 1}]
     while {1} {
-	if {$rowoptim - $optim_delay > $numcommits} {
-	    showstuff [expr {$rowoptim - $optim_delay}] 0
-	} elseif {$rowlaidout - $uparrowlen - 1 > $rowoptim} {
-	    set nr [expr {$rowlaidout - $uparrowlen - 1 - $rowoptim}]
+	if {$rowoptim - $showdelay > $numcommits} {
+	    showstuff [expr {$rowoptim - $showdelay}] $showlast
+	} elseif {$rowlaidout - $optdelay > $rowoptim} {
+	    set nr [expr {$rowlaidout - $optdelay - $rowoptim}]
 	    if {$nr > 100} {
 		set nr 100
 	    }
@@ -2579,9 +2670,23 @@ proc layoutmore {tmax} {
 		set nr 150
 	    }
 	    set row $rowlaidout
-	    set rowlaidout [layoutrows $row [expr {$row + $nr}] 0]
+	    set rowlaidout [layoutrows $row [expr {$row + $nr}] $allread]
 	    if {$rowlaidout == $row} {
 		return 0
+	    }
+	} elseif {$allread} {
+	    set optdelay 0
+	    set nrows $commitidx($curview)
+	    if {[lindex $rowidlist $nrows] ne {} ||
+		[array names idinlist] ne {}} {
+		layouttail
+		set rowlaidout $commitidx($curview)
+	    } elseif {$rowoptim == $nrows} {
+		set showdelay 0
+		set showlast 1
+		if {$numcommits == $nrows} {
+		    return 0
+		}
 	    }
 	} else {
 	    return 0
@@ -2674,34 +2779,30 @@ proc dohidelocalchanges {} {
 
 # spawn off a process to do git diff-index HEAD
 proc dodiffindex {} {
-    global localdiff localrow lserial
+    global localrow lserial
 
     incr lserial
-    set localdiff {}
     set localrow -1
     set fd [open "|git diff-index HEAD" r]
     fconfigure $fd -blocking 0
-    fileevent $fd readable [list readdiffindex $fd $lserial]
+    filerun $fd [list readdiffindex $fd $lserial]
 }
 
 proc readdiffindex {fd serial} {
-    global localdiff localrow commitrow mainheadid nullid curview
+    global localrow commitrow mainheadid nullid curview
     global commitinfo commitdata lserial
 
-    while {[gets $fd line] >= 0} {
-	set tl [split $line "\t"]
-	if {[llength $tl] < 2} {
-	    puts "bad line from readdiffindex: $line"
-	    continue
+    if {[gets $fd line] < 0} {
+	if {[eof $fd]} {
+	    close $fd
+	    return 0
 	}
-	if {$serial == $lserial} {
-	    lappend localdiff $tl
-	}
+	return 1
     }
-    if {[eof $fd]} {
-	close $fd
-    }
-    if {$serial == $lserial && $localdiff ne {} && $localrow == -1} {
+    # we only need to see one line and we don't really care what it says...
+    close $fd
+
+    if {$serial == $lserial && $localrow == -1} {
 	# add the line for the local diff to the graph
 	set localrow $commitrow($curview,$mainheadid)
 	set hl "Local uncommitted changes"
@@ -2709,6 +2810,7 @@ proc readdiffindex {fd serial} {
 	set commitdata($nullid) "\n    $hl\n"
 	insertrow $localrow $nullid
     }
+    return 0
 }
 
 proc layoutrows {row endrow last} {
@@ -2864,6 +2966,7 @@ proc layouttail {} {
     }
 
     foreach id [array names idinlist] {
+	unset idinlist($id)
 	addextraid $id $row
 	lset rowidlist $row [list $id]
 	lset rowoffsets $row 0
@@ -3579,34 +3682,6 @@ proc show_status {msg} {
 	-tags text -fill $fgcolor
 }
 
-proc finishcommits {} {
-    global commitidx phase curview misordered
-    global pending_select selectedline currentid nextupdate
-
-    if {$commitidx($curview) > 0} {
-	if {$misordered($curview)} {
-	    # misordering was detected that we couldn't fix in the reorder
-	    # buffer; re-do the layout from scratch
-	    if {[info exists selectedline]} {
-		set pending_select $currentid
-		unset selectedline
-	    }
-	    # note show_status does clear_display
-	    show_status "Redoing layout due to misordered commits"
-	    initlayout
-	    set misordered($curview) 0
-	    set nextupdate [expr {[clock clicks -milliseconds] + 100}]
-	    while {[layoutmore $nextupdate]} doupdate
-	}
-	drawrest
-    } else {
-	show_status "No commits selected"
-    }
-    notbusy layout
-    set phase {}
-    catch {unset pending_select}
-}
-
 # Insert a new commit as the child of the commit on row $row.
 # The new commit will be displayed on row $row and the commits
 # on that row and below will move down one row.
@@ -3831,25 +3906,6 @@ proc notbusy {what} {
 	. config -cursor $maincursor
 	settextcursor $textcursor
     }
-}
-
-proc drawrest {} {
-    global startmsecs
-    global rowlaidout commitidx curview rowoptim
-    global pending_select displayorder nullid
-
-    layoutrows $rowlaidout $commitidx($curview) 1
-    layouttail
-    optimize_rows $rowoptim 0 $commitidx($curview)
-    showstuff $commitidx($curview) 1
-    if {[info exists pending_select]} {
-	set row [expr {[lindex $displayorder 0] eq $nullid}]
-	selectline $row 1
-    }
-
-    set drawmsecs [expr {[clock clicks -milliseconds] - $startmsecs}]
-    #global numcommits
-    #puts "overall $drawmsecs ms for $numcommits commits"
 }
 
 proc findmatches {f} {
@@ -4498,7 +4554,7 @@ proc gettree {id} {
 	    set treefilelist($id) {}
 	    set treeidlist($id) {}
 	    fconfigure $gtf -blocking 0
-	    fileevent $gtf readable [list gettreeline $gtf $id]
+	    filerun $gtf [list gettreeline $gtf $id]
 	}
     } else {
 	setfilelist $id
@@ -4508,7 +4564,8 @@ proc gettree {id} {
 proc gettreeline {gtf id} {
     global treefilelist treeidlist treepending cmitmode diffids nullid
 
-    while {[gets $gtf line] >= 0} {
+    set nl 0
+    while {[incr nl] <= 1000 && [gets $gtf line] >= 0} {
 	if {$diffids ne $nullid} {
 	    set tl [split $line "\t"]
 	    if {[lindex $tl 0 1] ne "blob"} continue
@@ -4523,7 +4580,9 @@ proc gettreeline {gtf id} {
 	}
 	lappend treefilelist($id) $fname
     }
-    if {![eof $gtf]} return
+    if {![eof $gtf]} {
+	return [expr {$nl >= 1000? 2: 1}]
+    }
     close $gtf
     unset treepending
     if {$cmitmode ne "tree"} {
@@ -4535,6 +4594,7 @@ proc gettreeline {gtf id} {
     } else {
 	setfilelist $id
     }
+    return 0
 }
 
 proc showfile {f} {
@@ -4559,7 +4619,7 @@ proc showfile {f} {
 	}
     }
     fconfigure $bf -blocking 0
-    fileevent $bf readable [list getblobline $bf $diffids]
+    filerun $bf [list getblobline $bf $diffids]
     $ctext config -state normal
     clear_ctext $commentend
     $ctext insert end "\n"
@@ -4573,18 +4633,21 @@ proc getblobline {bf id} {
 
     if {$id ne $diffids || $cmitmode ne "tree"} {
 	catch {close $bf}
-	return
+	return 0
     }
     $ctext config -state normal
-    while {[gets $bf line] >= 0} {
+    set nl 0
+    while {[incr nl] <= 1000 && [gets $bf line] >= 0} {
 	$ctext insert end "$line\n"
     }
     if {[eof $bf]} {
 	# delete last newline
 	$ctext delete "end - 2c" "end - 1c"
 	close $bf
+	return 0
     }
     $ctext config -state disabled
+    return [expr {$nl >= 1000? 2: 1}]
 }
 
 proc mergediff {id l} {
@@ -4604,83 +4667,78 @@ proc mergediff {id l} {
     fconfigure $mdf -blocking 0
     set mdifffd($id) $mdf
     set np [llength [lindex $parentlist $l]]
-    fileevent $mdf readable [list getmergediffline $mdf $id $np]
-    set nextupdate [expr {[clock clicks -milliseconds] + 100}]
+    filerun $mdf [list getmergediffline $mdf $id $np]
 }
 
 proc getmergediffline {mdf id np} {
-    global diffmergeid ctext cflist nextupdate mergemax
+    global diffmergeid ctext cflist mergemax
     global difffilestart mdifffd
 
-    set n [gets $mdf line]
-    if {$n < 0} {
-	if {[eof $mdf]} {
-	    close $mdf
-	}
-	return
-    }
-    if {![info exists diffmergeid] || $id != $diffmergeid
-	|| $mdf != $mdifffd($id)} {
-	return
-    }
     $ctext conf -state normal
-    if {[regexp {^diff --cc (.*)} $line match fname]} {
-	# start of a new file
-	$ctext insert end "\n"
-	set here [$ctext index "end - 1c"]
-	lappend difffilestart $here
-	add_flist [list $fname]
-	set l [expr {(78 - [string length $fname]) / 2}]
-	set pad [string range "----------------------------------------" 1 $l]
-	$ctext insert end "$pad $fname $pad\n" filesep
-    } elseif {[regexp {^@@} $line]} {
-	$ctext insert end "$line\n" hunksep
-    } elseif {[regexp {^[0-9a-f]{40}$} $line] || [regexp {^index} $line]} {
-	# do nothing
-    } else {
-	# parse the prefix - one ' ', '-' or '+' for each parent
-	set spaces {}
-	set minuses {}
-	set pluses {}
-	set isbad 0
-	for {set j 0} {$j < $np} {incr j} {
-	    set c [string range $line $j $j]
-	    if {$c == " "} {
-		lappend spaces $j
-	    } elseif {$c == "-"} {
-		lappend minuses $j
-	    } elseif {$c == "+"} {
-		lappend pluses $j
-	    } else {
-		set isbad 1
-		break
+    set nr 0
+    while {[incr nr] <= 1000 && [gets $mdf line] >= 0} {
+	if {![info exists diffmergeid] || $id != $diffmergeid
+	    || $mdf != $mdifffd($id)} {
+	    close $mdf
+	    return 0
+	}
+	if {[regexp {^diff --cc (.*)} $line match fname]} {
+	    # start of a new file
+	    $ctext insert end "\n"
+	    set here [$ctext index "end - 1c"]
+	    lappend difffilestart $here
+	    add_flist [list $fname]
+	    set l [expr {(78 - [string length $fname]) / 2}]
+	    set pad [string range "----------------------------------------" 1 $l]
+	    $ctext insert end "$pad $fname $pad\n" filesep
+	} elseif {[regexp {^@@} $line]} {
+	    $ctext insert end "$line\n" hunksep
+	} elseif {[regexp {^[0-9a-f]{40}$} $line] || [regexp {^index} $line]} {
+	    # do nothing
+	} else {
+	    # parse the prefix - one ' ', '-' or '+' for each parent
+	    set spaces {}
+	    set minuses {}
+	    set pluses {}
+	    set isbad 0
+	    for {set j 0} {$j < $np} {incr j} {
+		set c [string range $line $j $j]
+		if {$c == " "} {
+		    lappend spaces $j
+		} elseif {$c == "-"} {
+		    lappend minuses $j
+		} elseif {$c == "+"} {
+		    lappend pluses $j
+		} else {
+		    set isbad 1
+		    break
+		}
 	    }
-	}
-	set tags {}
-	set num {}
-	if {!$isbad && $minuses ne {} && $pluses eq {}} {
-	    # line doesn't appear in result, parents in $minuses have the line
-	    set num [lindex $minuses 0]
-	} elseif {!$isbad && $pluses ne {} && $minuses eq {}} {
-	    # line appears in result, parents in $pluses don't have the line
-	    lappend tags mresult
-	    set num [lindex $spaces 0]
-	}
-	if {$num ne {}} {
-	    if {$num >= $mergemax} {
-		set num "max"
+	    set tags {}
+	    set num {}
+	    if {!$isbad && $minuses ne {} && $pluses eq {}} {
+		# line doesn't appear in result, parents in $minuses have the line
+		set num [lindex $minuses 0]
+	    } elseif {!$isbad && $pluses ne {} && $minuses eq {}} {
+		# line appears in result, parents in $pluses don't have the line
+		lappend tags mresult
+		set num [lindex $spaces 0]
 	    }
-	    lappend tags m$num
+	    if {$num ne {}} {
+		if {$num >= $mergemax} {
+		    set num "max"
+		}
+		lappend tags m$num
+	    }
+	    $ctext insert end "$line\n" $tags
 	}
-	$ctext insert end "$line\n" $tags
     }
     $ctext conf -state disabled
-    if {[clock clicks -milliseconds] >= $nextupdate} {
-	incr nextupdate 100
-	fileevent $mdf readable {}
-	update
-	fileevent $mdf readable [list getmergediffline $mdf $id $np]
+    if {[eof $mdf]} {
+	close $mdf
+	return 0
     }
+    return [expr {$nr >= 1000? 2: 1}]
 }
 
 proc startdiff {ids} {
@@ -4731,37 +4789,39 @@ proc gettreediffs {ids} {
     set treediff {}
     if {[catch {set gdtf [open [diffcmd $ids {}] r]}]} return
     fconfigure $gdtf -blocking 0
-    fileevent $gdtf readable [list gettreediffline $gdtf $ids]
+    filerun $gdtf [list gettreediffline $gdtf $ids]
 }
 
 proc gettreediffline {gdtf ids} {
     global treediff treediffs treepending diffids diffmergeid
     global cmitmode
 
-    set n [gets $gdtf line]
-    if {$n < 0} {
-	if {![eof $gdtf]} return
-	close $gdtf
-	set treediffs($ids) $treediff
-	unset treepending
-	if {$cmitmode eq "tree"} {
-	    gettree $diffids
-	} elseif {$ids != $diffids} {
-	    if {![info exists diffmergeid]} {
-		gettreediffs $diffids
-	    }
-	} else {
-	    addtocflist $ids
-	}
-	return
+    set nr 0
+    while {[incr nr] <= 1000 && [gets $gdtf line] >= 0} {
+	set file [lindex $line 5]
+	lappend treediff $file
     }
-    set file [lindex $line 5]
-    lappend treediff $file
+    if {![eof $gdtf]} {
+	return [expr {$nr >= 1000? 2: 1}]
+    }
+    close $gdtf
+    set treediffs($ids) $treediff
+    unset treepending
+    if {$cmitmode eq "tree"} {
+	gettree $diffids
+    } elseif {$ids != $diffids} {
+	if {![info exists diffmergeid]} {
+	    gettreediffs $diffids
+	}
+    } else {
+	addtocflist $ids
+    }
+    return 0
 }
 
 proc getblobdiffs {ids} {
     global diffopts blobdifffd diffids env curdifftag curtagstart
-    global nextupdate diffinhdr treediffs
+    global diffinhdr treediffs
 
     set env(GIT_DIFF_OPTS) $diffopts
     if {[catch {set bdf [open [diffcmd $ids {-p -C}] r]} err]} {
@@ -4773,8 +4833,7 @@ proc getblobdiffs {ids} {
     set blobdifffd($ids) $bdf
     set curdifftag Comments
     set curtagstart 0.0
-    fileevent $bdf readable [list getblobdiffline $bdf $diffids]
-    set nextupdate [expr {[clock clicks -milliseconds] + 100}]
+    filerun $bdf [list getblobdiffline $bdf $diffids]
 }
 
 proc setinlist {var i val} {
@@ -4793,81 +4852,78 @@ proc setinlist {var i val} {
 proc getblobdiffline {bdf ids} {
     global diffids blobdifffd ctext curdifftag curtagstart
     global diffnexthead diffnextnote difffilestart
-    global nextupdate diffinhdr treediffs
+    global diffinhdr treediffs
 
-    set n [gets $bdf line]
-    if {$n < 0} {
-	if {[eof $bdf]} {
-	    close $bdf
-	    if {$ids == $diffids && $bdf == $blobdifffd($ids)} {
-		$ctext tag add $curdifftag $curtagstart end
-	    }
-	}
-	return
-    }
-    if {$ids != $diffids || $bdf != $blobdifffd($ids)} {
-	return
-    }
+    set nr 0
     $ctext conf -state normal
-    if {[regexp {^diff --git a/(.*) b/(.*)} $line match fname newname]} {
-	# start of a new file
-	$ctext insert end "\n"
-	$ctext tag add $curdifftag $curtagstart end
-	set here [$ctext index "end - 1c"]
-	set curtagstart $here
-	set header $newname
-	set i [lsearch -exact $treediffs($ids) $fname]
-	if {$i >= 0} {
-	    setinlist difffilestart $i $here
+    while {[incr nr] <= 1000 && [gets $bdf line] >= 0} {
+	if {$ids != $diffids || $bdf != $blobdifffd($ids)} {
+	    close $bdf
+	    return 0
 	}
-	if {$newname ne $fname} {
-	    set i [lsearch -exact $treediffs($ids) $newname]
+	if {[regexp {^diff --git a/(.*) b/(.*)} $line match fname newname]} {
+	    # start of a new file
+	    $ctext insert end "\n"
+	    $ctext tag add $curdifftag $curtagstart end
+	    set here [$ctext index "end - 1c"]
+	    set curtagstart $here
+	    set header $newname
+	    set i [lsearch -exact $treediffs($ids) $fname]
 	    if {$i >= 0} {
 		setinlist difffilestart $i $here
 	    }
-	}
-	set curdifftag "f:$fname"
-	$ctext tag delete $curdifftag
-	set l [expr {(78 - [string length $header]) / 2}]
-	set pad [string range "----------------------------------------" 1 $l]
-	$ctext insert end "$pad $header $pad\n" filesep
-	set diffinhdr 1
-    } elseif {$diffinhdr && [string compare -length 3 $line "---"] == 0} {
-	# do nothing
-    } elseif {$diffinhdr && [string compare -length 3 $line "+++"] == 0} {
-	set diffinhdr 0
-    } elseif {[regexp {^@@ -([0-9]+),([0-9]+) \+([0-9]+),([0-9]+) @@(.*)} \
-		   $line match f1l f1c f2l f2c rest]} {
-	$ctext insert end "$line\n" hunksep
-	set diffinhdr 0
-    } else {
-	set x [string range $line 0 0]
-	if {$x == "-" || $x == "+"} {
-	    set tag [expr {$x == "+"}]
-	    $ctext insert end "$line\n" d$tag
-	} elseif {$x == " "} {
-	    $ctext insert end "$line\n"
-	} elseif {$diffinhdr || $x == "\\"} {
-	    # e.g. "\ No newline at end of file"
-	    $ctext insert end "$line\n" filesep
-	} else {
-	    # Something else we don't recognize
-	    if {$curdifftag != "Comments"} {
-		$ctext insert end "\n"
-		$ctext tag add $curdifftag $curtagstart end
-		set curtagstart [$ctext index "end - 1c"]
-		set curdifftag Comments
+	    if {$newname ne $fname} {
+		set i [lsearch -exact $treediffs($ids) $newname]
+		if {$i >= 0} {
+		    setinlist difffilestart $i $here
+		}
 	    }
-	    $ctext insert end "$line\n" filesep
+	    set curdifftag "f:$fname"
+	    $ctext tag delete $curdifftag
+	    set l [expr {(78 - [string length $header]) / 2}]
+	    set pad [string range "----------------------------------------" \
+			 1 $l]
+	    $ctext insert end "$pad $header $pad\n" filesep
+	    set diffinhdr 1
+	} elseif {$diffinhdr && [string compare -length 3 $line "---"] == 0} {
+	    # do nothing
+	} elseif {$diffinhdr && [string compare -length 3 $line "+++"] == 0} {
+	    set diffinhdr 0
+	} elseif {[regexp {^@@ -([0-9]+),([0-9]+) \+([0-9]+),([0-9]+) @@(.*)} \
+		       $line match f1l f1c f2l f2c rest]} {
+	    $ctext insert end "$line\n" hunksep
+	    set diffinhdr 0
+	} else {
+	    set x [string range $line 0 0]
+	    if {$x == "-" || $x == "+"} {
+		set tag [expr {$x == "+"}]
+		$ctext insert end "$line\n" d$tag
+	    } elseif {$x == " "} {
+		$ctext insert end "$line\n"
+	    } elseif {$diffinhdr || $x == "\\"} {
+		# e.g. "\ No newline at end of file"
+		$ctext insert end "$line\n" filesep
+	    } else {
+		# Something else we don't recognize
+		if {$curdifftag != "Comments"} {
+		    $ctext insert end "\n"
+		    $ctext tag add $curdifftag $curtagstart end
+		    set curtagstart [$ctext index "end - 1c"]
+		    set curdifftag Comments
+		}
+		$ctext insert end "$line\n" filesep
+	    }
 	}
     }
     $ctext conf -state disabled
-    if {[clock clicks -milliseconds] >= $nextupdate} {
-	incr nextupdate 100
-	fileevent $bdf readable {}
-	update
-	fileevent $bdf readable "getblobdiffline $bdf {$ids}"
+    if {[eof $bdf]} {
+	close $bdf
+	if {$ids == $diffids && $bdf == $blobdifffd($ids)} {
+	    $ctext tag add $curdifftag $curtagstart end
+	}
+	return 0
     }
+    return [expr {$nr >= 1000? 2: 1}]
 }
 
 proc nextfile {} {
@@ -5783,7 +5839,8 @@ proc getallcommits {} {
     fconfigure $fd -blocking 0
     set allcommits "reading"
     nowbusy allcommits
-    restartgetall $fd
+    filerun $fd [list getallclines $fd]
+    set allcstart [clock clicks -milliseconds]
 }
 
 proc discardallcommits {} {
@@ -5798,13 +5855,6 @@ proc discardallcommits {} {
 		alldtags tagisdesc desc_heads} {
 	catch {unset $v}
     }
-}
-
-proc restartgetall {fd} {
-    global allcstart
-
-    fileevent $fd readable [list getallclines $fd]
-    set allcstart [clock clicks -milliseconds]
 }
 
 proc combine_dtags {l1 l2} {
@@ -5908,7 +5958,8 @@ proc getallclines {fd} {
     global desc_tags anc_tags idtags tagisdesc allids
     global idheads travindex
 
-    while {[gets $fd line] >= 0} {
+    set nc 0
+    while {[incr nc] <= 1000 && [gets $fd line] >= 0} {
 	set id [lindex $line 0]
 	lappend allids $id
 	set olds [lrange $line 1 end]
@@ -5922,30 +5973,27 @@ proc getallclines {fd} {
 	# compute nearest tagged descendents as we go
 	# also compute descendent heads
 	forward_pass $id $allchildren($id)
-	if {[clock clicks -milliseconds] - $allcstart >= 50} {
-	    fileevent $fd readable {}
-	    after idle restartgetall $fd
-	    return
-	}
     }
     if {[eof $fd]} {
 	set travindex [llength $allids]
 	set allcommits "traversing"
-	after idle restartatags
+	run restartatags
 	if {[catch {close $fd} err]} {
 	    error_popup "Error reading full commit graph: $err.\n\
 			 Results may be incomplete."
 	}
+	return 0
     }
+    return [expr {$nc >= 1000? 2: 1}]
 }
 
 # walk backward through the tree and compute nearest tagged ancestors
 proc restartatags {} {
     global allids allparents idtags anc_tags travindex
 
-    set t0 [clock clicks -milliseconds]
     set i $travindex
-    while {[incr i -1] >= 0} {
+    set imin [expr {$i <= 1000? 0: $i - 1000}]
+    while {[incr i -1] >= $imin} {
 	set id [lindex $allids $i]
 	set atags {}
 	foreach p $allparents($id) {
@@ -5961,16 +6009,12 @@ proc restartatags {} {
 	    }
 	}
 	set anc_tags($id) $atags
-	if {[clock clicks -milliseconds] - $t0 >= 50} {
-	    set travindex $i
-	    after idle restartatags
-	    return
-	}
     }
     set allcommits "done"
     set travindex 0
     notbusy allcommits
     dispneartags
+    return 0
 }
 
 # update the desc_tags and anc_tags arrays for a new tag just added
@@ -6144,7 +6188,7 @@ proc changedrefs {} {
 	set travindex [llength $allids]
 	if {$allcommits ne "traversing"} {
 	    set allcommits "traversing"
-	    after idle restartatags
+	    run restartatags
 	}
     }
 }
@@ -6730,6 +6774,7 @@ if {$i >= 0} {
 
 set nullid "0000000000000000000000000000000000000000"
 
+set runq {}
 set history {}
 set historyindex 0
 set fh_serial 0
