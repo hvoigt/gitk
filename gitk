@@ -4188,7 +4188,10 @@ proc viewnextline {dir} {
 proc appendrefs {pos tags var} {
     global ctext commitrow linknum curview $var maxrefs
 
-    if {[catch {$ctext index $pos}]} {
+    # Don't do anything if pos has been deleted or is not at the end
+    # of the line (meaning stuff has already been inserted here).
+    if {[catch {set col [lindex [split [$ctext index $pos] .] 1]}] ||
+	$col > [string length $pos] + 2} {
 	return 0
     }
     if {[llength $tags] > $maxrefs} {
@@ -4212,7 +4215,6 @@ proc appendrefs {pos tags var} {
 	    }
 	    set sep ", "
 	}
-	set sep ", "
     }
     return [llength $tags]
 }
@@ -4239,7 +4241,7 @@ proc dispneartags {} {
     $ctext conf -state normal
     if {[info exists desc_heads($id)]} {
 	if {[appendrefs branch $desc_heads($id) headids] > 1} {
-	    $ctext insert "branch -2c" "es"
+	    $ctext insert "branch linestart +6c" "es"
 	}
     }
     if {[info exists anc_tags($id)]} {
@@ -4375,28 +4377,24 @@ proc selectline {l isnew} {
 	if {![info exists allcommits]} {
 	    getallcommits
 	}
-	$ctext insert end "Branch: "
-	$ctext mark set branch "end -1c"
-	$ctext mark gravity branch left
+	$ctext insert end "Branch: \n"
+	$ctext mark set branch "end -2c"
 	if {[info exists desc_heads($id)]} {
 	    if {[appendrefs branch $desc_heads($id) headids] > 1} {
 		# turn "Branch" into "Branches"
-		$ctext insert "branch -2c" "es"
+		$ctext insert "branch linestart +6c" "es"
 	    }
 	}
-	$ctext insert end "\nFollows: "
-	$ctext mark set follows "end -1c"
-	$ctext mark gravity follows left
+	$ctext insert end "Follows: \n"
+	$ctext mark set follows "end -2c"
 	if {[info exists anc_tags($id)]} {
 	    appendrefs follows [taglist $anc_tags($id)] tagids
 	}
-	$ctext insert end "\nPrecedes: "
-	$ctext mark set precedes "end -1c"
-	$ctext mark gravity precedes left
+	$ctext insert end "Precedes: \n"
+	$ctext mark set precedes "end -2c"
 	if {[info exists desc_tags($id)]} {
 	    appendrefs precedes [taglist $desc_tags($id)] tagids
 	}
-	$ctext insert end "\n"
     }
     $ctext insert end "\n"
     appendwithlinks [lindex $info 5] {comment}
@@ -5764,25 +5762,24 @@ proc cherrypick {} {
 
 # context menu for a head
 proc headmenu {x y id head} {
-    global headmenuid headmenuhead headctxmenu
+    global headmenuid headmenuhead headctxmenu desc_heads
 
     set headmenuid $id
     set headmenuhead $head
+    set state [expr {[info exists desc_heads($id)]? "normal": "disabled"}]
+    $headctxmenu entryconfigure 1 -state $state
     tk_popup $headctxmenu $x $y
 }
 
 proc cobranch {} {
     global headmenuid headmenuhead mainhead headids
-    global showlocalchanges localrow mainheadid
+    global showlocalchanges mainheadid
 
     # check the tree is clean first??
     set oldmainhead $mainhead
     nowbusy checkout
     update
-    if {$localrow >= 0} {
-	removerow $localrow
-	set localrow -1
-    }
+    dohidelocalchanges
     if {[catch {
 	exec git checkout $headmenuhead
     } err]} {
@@ -5955,7 +5952,7 @@ proc forward_pass {id children} {
 
 proc getallclines {fd} {
     global allparents allchildren allcommits allcstart
-    global desc_tags anc_tags idtags tagisdesc allids
+    global desc_tags idtags tagisdesc allids
     global idheads travindex
 
     set nc 0
@@ -6010,8 +6007,11 @@ proc restartatags {} {
 	}
 	set anc_tags($id) $atags
     }
+    set travindex [expr {$i+1}]
+    if {$i >= 0} {
+	return 1
+    }
     set allcommits "done"
-    set travindex 0
     notbusy allcommits
     dispneartags
     return 0
