@@ -407,7 +407,7 @@ proc getcommitlines {fd view}  {
 
 proc chewcommits {view} {
     global curview misordered hlview commfd
-    global selectedline pending_select
+    global selectedline pending_select currentid
 
     set more 0
     if {$view == $curview} {
