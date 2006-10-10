@@ -5924,11 +5924,15 @@ proc cherrypick {} {
 
 # context menu for a head
 proc headmenu {x y id head} {
-    global headmenuid headmenuhead headctxmenu desc_heads
+    global headmenuid headmenuhead headctxmenu desc_heads mainhead
 
     set headmenuid $id
     set headmenuhead $head
-    set state [expr {[info exists desc_heads($id)]? "normal": "disabled"}]
+    set state disabled
+    if {[info exists desc_heads($id)] && $head ne $mainhead} {
+	set state normal
+    }
+    $headctxmenu entryconfigure 0 -state $state
     $headctxmenu entryconfigure 1 -state $state
     tk_popup $headctxmenu $x $y
 }
@@ -5967,6 +5971,7 @@ proc rmbranch {} {
 
     set head $headmenuhead
     set id $headmenuid
+    # this check shouldn't be needed any more...
     if {$head eq $mainhead} {
 	error_popup "Cannot delete the currently checked-out branch"
 	return
