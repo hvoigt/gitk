@@ -3160,35 +3160,33 @@ proc adjarrowhigh {coords} {
     return $coords
 }
 
-proc firstchild {id} {
-    global idrowranges commitrow rowrangelist curview
-
-    set fc {}
-    if {[info exists idrowranges($id)]} {
-	set fc [lindex $idrowranges($id) 0]
-    } elseif {[info exists commitrow($curview,$id)]} {
-	set fc [lindex $rowrangelist $commitrow($curview,$id) 0]
-    }
-    return $fc
-}
-
 proc drawlineseg {id row endrow arrowlow} {
-    global rowidlist rowoffsets displayorder iddrawn linesegs
+    global rowidlist displayorder iddrawn linesegs
     global canv colormap linespc curview maxlinelen
 
+    set cols [list [lsearch -exact [lindex $rowidlist $row] $id]]
     set le [expr {$row + 1}]
     set arrowhigh 1
     while {1} {
+	set c [lsearch -exact [lindex $rowidlist $le] $id]
+	if {$c < 0} {
+	    incr le -1
+	    break
+	}
+	lappend cols $c
 	set x [lindex $displayorder $le]
 	if {$x eq $id} {
 	    set arrowhigh 0
 	    break
 	}
-	if {[lsearch -exact [lindex $rowidlist $le] $id] < 0} {
-	    incr le -1
+	if {[info exists iddrawn($x)] || $le == $endrow} {
+	    set c [lsearch -exact [lindex $rowidlist [expr {$le+1}]] $id]
+	    if {$c >= 0} {
+		lappend cols $c
+		set arrowhigh 0
+	    }
 	    break
 	}
-	if {[info exists iddrawn($x)] || $le == $endrow} break
 	incr le
     }
     if {$le <= $row} {
@@ -3201,9 +3199,10 @@ proc drawlineseg {id row endrow arrowlow} {
     if {[info exists linesegs($id)]} {
 	set lines $linesegs($id)
 	foreach li $lines {
-	    if {[lindex $li 0] > $row} {
-		if {[lindex $li 1] - [lindex $li 0] < $maxlinelen} {
-		    set joinhigh [expr {[lindex $li 0] == $le}]
+	    set r0 [lindex $li 0]
+	    if {$r0 > $row} {
+		if {$r0 == $le && [lindex $li 1] - $row <= $maxlinelen} {
+		    set joinhigh 1
 		}
 		break
 	    }
@@ -3213,35 +3212,26 @@ proc drawlineseg {id row endrow arrowlow} {
     set joinlow 0
     if {$i > 0} {
 	set li [lindex $lines [expr {$i-1}]]
-	if {[lindex $li 1] - [lindex $li 0] < $maxlinelen} {
-	    set joinlow [expr {[lindex $li 1] == $row}]
+	set r1 [lindex $li 1]
+	if {$r1 == $row && $le - [lindex $li 0] <= $maxlinelen} {
+	    set joinlow 1
 	}
     }
 
-    set x [lsearch -exact [lindex $rowidlist $le] $id]
-    if {$x < 0} {
-	puts "oops: drawlineseg: id $id not on row $le"
-	return
-    }
-    set dir [lindex $rowoffsets $le $x]
+    set x [lindex $cols [expr {$le - $row}]]
+    set xp [lindex $cols [expr {$le - 1 - $row}]]
+    set dir [expr {$xp - $x}]
     if {$joinhigh} {
 	set ith [lindex $lines $i 2]
 	set coords [$canv coords $ith]
 	set ah [$canv itemcget $ith -arrow]
 	set arrowhigh [expr {$ah eq "first" || $ah eq "both"}]
-	set x2 [lsearch -exact [lindex $rowidlist [expr {$le+1}]] $id]
-	if {$x2 >= 0} {
-	    set dir2 [lindex $rowoffsets [expr {$le+1}] $x2]
-	    if {$dir2 == $dir} {
-		set coords [lrange $coords 0 end-2]
-	    }
+	set x2 [lindex $cols [expr {$le + 1 - $row}]]
+	if {$x2 ne {} && $x - $x2 == $dir} {
+	    set coords [lrange $coords 0 end-2]
 	}
     } else {
 	set coords [list [xc $le $x] [yc $le]]
-	if {$arrowhigh &&
-	    [lsearch -exact [lindex $rowidlist [expr {$le+1}]] $id] >= 0} {
-	    set arrowhigh 0
-	}
     }
     if {$joinlow} {
 	set itl [lindex $lines [expr {$i-1}] 2]
@@ -3253,21 +3243,18 @@ proc drawlineseg {id row endrow arrowlow} {
     }
     set arrow [lindex {none first last both} [expr {$arrowhigh + 2*$arrowlow}]]
     for {set y $le} {[incr y -1] > $row} {} {
-	if {$dir eq {}} {
-	    puts "oops null dir row=$row y=$y le=$le id=[shortids $id]"
-	} else {
-	    incr x $dir
-	}
-	set ndir [lindex $rowoffsets $y $x]
-	if {$dir != $ndir} {
+	set x $xp
+	set xp [lindex $cols [expr {$y - 1 - $row}]]
+	set ndir [expr {$xp - $x}]
+	if {$dir != $ndir || $xp < 0} {
 	    lappend coords [xc $y $x] [yc $y]
 	}
 	set dir $ndir
     }
     if {!$joinlow} {
-	if {$dir eq {}} {
+	if {$xp < 0} {
 	    # join parent line to first child
-	    set ch [firstchild $id]
+	    set ch [lindex $displayorder $row]
 	    set xc [lsearch -exact [lindex $rowidlist $row] $ch]
 	    if {$xc < 0} {
 		puts "oops: drawlineseg: child $ch not on row $row"
@@ -3281,15 +3268,14 @@ proc drawlineseg {id row endrow arrowlow} {
 	    }
 	    lappend coords [xc $row $x] [yc $row]
 	} else {
-	    incr x $dir
-	    set xn [xc $row $x]
+	    set xn [xc $row $xp]
 	    set yn [yc $row]
 	    # work around tk8.4 refusal to draw arrows on diagonal segments
 	    if {$arrowlow && $xn != [lindex $coords end-1]} {
 		if {[llength $coords] < 4 ||
 		    [lindex $coords end-3] != [lindex $coords end-1] ||
 		    [lindex $coords end] - $yn > 2 * $linespc} {
-		    set xn [xc $row [expr {$x - 0.5 * $dir}]]
+		    set xn [xc $row [expr {$xp - 0.5 * $dir}]]
 		    set yo [yc [expr {$row + 0.5}]]
 		    lappend coords $xn $yo $xn $yn
 		}
@@ -3315,9 +3301,9 @@ proc drawlineseg {id row endrow arrowlow} {
 	    lset lines $i 0 $row
 	}
     } else {
-	incr x $dir
+	set xo [lsearch -exact [lindex $rowidlist [expr {$row - 1}]] $id]
+	set ndir [expr {$xo - $xp}]
 	set clow [$canv coords $itl]
-	set ndir [lindex $rowoffsets $row $x]
 	if {$dir == $ndir} {
 	    set clow [lrange $clow 2 end]
 	}
@@ -3345,10 +3331,11 @@ proc drawlineseg {id row endrow arrowlow} {
 }
 
 proc drawparentlinks {id row} {
-    global rowidlist canv colormap firstchild curview parentlist
+    global rowidlist canv colormap curview parentlist
     global idpos
 
-    set col [lsearch -exact [lindex $rowidlist $row] $id]
+    set rowids [lindex $rowidlist $row]
+    set col [lsearch -exact $rowids $id]
     if {$col < 0} return
     set olds [lindex $parentlist $row]
     set row2 [expr {$row + 1}]
@@ -3368,7 +3355,7 @@ proc drawparentlinks {id row} {
 	if {$x2 > $rmx} {
 	    set rmx $x2
 	}
-	if {$id eq [firstchild $p]} {
+	if {[lsearch -exact $rowids $p] < 0} {
 	    # drawlineseg will do this one for us
 	    continue
 	}
@@ -3504,7 +3491,7 @@ proc drawcmitrow {row} {
 
 proc drawcommits {row endrow} {
     global numcommits iddrawn displayorder curview
-    global parentlist rowidlist optim_delay rowoptim
+    global parentlist rowidlist
 
     if {$row < 0} {
 	set row 0
@@ -3537,12 +3524,13 @@ proc drawcommits {row endrow} {
 	}
 	drawparentlinks $id $r
 
-	foreach lid [lindex $rowidlist $r] {
+	set rowids [lindex $rowidlist $r]
+	foreach lid $rowids {
 	    if {$lid eq {}} continue
 	    if {$lid eq $id} {
 		# see if this is the first child of any of its parents
 		foreach p [lindex $parentlist $r] {
-		    if {$id eq [firstchild $p]} {
+		    if {[lsearch -exact $rowids $p] < 0} {
 			# make this line extend up to the child
 			set le [drawlineseg $p $r $er 0]
 			lappend lineends($le) $p
