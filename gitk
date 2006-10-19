@@ -3489,12 +3489,15 @@ proc drawcmitrow {row} {
     set iddrawn($id) 1
 }
 
-proc drawcommits {row endrow} {
+proc drawcommits {row {endrow {}}} {
     global numcommits iddrawn displayorder curview
     global parentlist rowidlist
 
     if {$row < 0} {
 	set row 0
+    }
+    if {$endrow eq {}} {
+	set endrow $row
     }
     if {$endrow >= $numcommits} {
 	set endrow [expr {$numcommits - 1}]
@@ -3524,6 +3527,11 @@ proc drawcommits {row endrow} {
 	}
 	drawparentlinks $id $r
 
+	if {[info exists lineends($r)]} {
+	    foreach lid $lineends($r) {
+		unset prevlines($lid)
+	    }
+	}
 	set rowids [lindex $rowidlist $r]
 	foreach lid $rowids {
 	    if {$lid eq {}} continue
@@ -3541,11 +3549,6 @@ proc drawcommits {row endrow} {
 		set le [drawlineseg $lid $r $er 1]
 		lappend lineends($le) $lid
 		set prevlines($lid) 1
-	    }
-	}
-	if {[info exists lineends($r)]} {
-	    foreach lid $lineends($r) {
-		unset prevlines($lid)
 	    }
 	}
     }
@@ -4041,13 +4044,13 @@ proc dofind {} {
 	    if {$matches == {}} continue
 	    set doesmatch 1
 	    if {$ty == "Headline"} {
-		drawcmitrow $l
+		drawcommits $l
 		markmatches $canv $l $f $linehtag($l) $matches $mainfont
 	    } elseif {$ty == "Author"} {
-		drawcmitrow $l
+		drawcommits $l
 		markmatches $canv2 $l $f $linentag($l) $matches $mainfont
 	    } elseif {$ty == "Date"} {
-		drawcmitrow $l
+		drawcommits $l
 		markmatches $canv3 $l $f $linedtag($l) $matches $mainfont
 	    }
 	}
@@ -4140,7 +4143,7 @@ proc stopfindproc {{done 0}} {
 proc markheadline {l id} {
     global canv mainfont linehtag
 
-    drawcmitrow $l
+    drawcommits $l
     set bbox [$canv bbox $linehtag($l)]
     set t [$canv create rect $bbox -outline {} -tags matches -fill yellow]
     $canv lower $t
@@ -5643,10 +5646,11 @@ proc domktag {} {
 
 proc redrawtags {id} {
     global canv linehtag commitrow idpos selectedline curview
-    global mainfont canvxmax
+    global mainfont canvxmax iddrawn
 
     if {![info exists commitrow($curview,$id)]} return
-    drawcmitrow $commitrow($curview,$id)
+    if {![info exists iddrawn($id)]} return
+    drawcommits $commitrow($curview,$id)
     $canv delete tag.$id
     set xt [eval drawtags $id $idpos($id)]
     $canv coords $linehtag($commitrow($curview,$id)) $xt [lindex $idpos($id) 2]
