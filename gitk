@@ -8,7 +8,6 @@ exec wish "$0" -- "$@"
 # either version 2, or (at your option) any later version.
 
 package require Tcl 8.4
-package require Thread 2.6
 
 proc gitdir {} {
     global env
@@ -19,480 +18,1050 @@ proc gitdir {} {
     }
 }
 
-# A simple scheduler for compute-intensive stuff.
-# The aim is to make sure that event handlers for GUI actions can
-# run at least every 50-100 ms.  Unfortunately fileevent handlers are
-# run before X event handlers, so reading from a fast source can
-# make the GUI completely unresponsive.
-proc run args {
-    global isonrunq runq
+# Stuff needed by both the main thread and the layout thread
+set commonstuff {
 
-    set script $args
-    if {[info exists isonrunq($script)]} return
-    if {$runq eq {}} {
-	after idle dorunq
+    # A simple scheduler for compute-intensive stuff.
+    # The aim is to make sure that event handlers for GUI actions can
+    # run at least every 50-100 ms.  Unfortunately fileevent handlers are
+    # run before X event handlers, so reading from a fast source can
+    # make the GUI completely unresponsive.
+    set runq {}
+
+    proc run args {
+	global isonrunq runq
+
+	set script $args
+	if {[info exists isonrunq($script)]} return
+	if {$runq eq {}} {
+	    after idle dorunq
+	}
+	lappend runq [list {} $script]
+	set isonrunq($script) 1
     }
-    lappend runq [list {} $script]
-    set isonrunq($script) 1
-}
 
-proc filerun {fd script} {
-    fileevent $fd readable [list filereadable $fd $script]
-}
-
-proc filereadable {fd script} {
-    global runq
-
-    fileevent $fd readable {}
-    if {$runq eq {}} {
-	after idle dorunq
+    proc filerun {fd script} {
+	fileevent $fd readable [list filereadable $fd $script]
     }
-    lappend runq [list $fd $script]
-}
 
-proc dorunq {} {
-    global isonrunq runq
+    proc filereadable {fd script} {
+	global runq
 
-    set tstart [clock clicks -milliseconds]
-    set t0 $tstart
-    while {$runq ne {}} {
-	set fd [lindex $runq 0 0]
-	set script [lindex $runq 0 1]
-	set repeat [eval $script]
-	set t1 [clock clicks -milliseconds]
-	set t [expr {$t1 - $t0}]
-	set runq [lrange $runq 1 end]
-	if {$repeat ne {} && $repeat} {
-	    if {$fd eq {} || $repeat == 2} {
-		# script returns 1 if it wants to be readded
-		# file readers return 2 if they could do more straight away
-		lappend runq [list $fd $script]
-	    } else {
-		fileevent $fd readable [list filereadable $fd $script]
+	fileevent $fd readable {}
+	if {$runq eq {}} {
+	    after idle dorunq
+	}
+	lappend runq [list $fd $script]
+    }
+
+    proc dorunq {} {
+	global isonrunq runq
+
+	set tstart [clock clicks -milliseconds]
+	set t0 $tstart
+	while {$runq ne {}} {
+	    set fd [lindex $runq 0 0]
+	    set script [lindex $runq 0 1]
+	    set repeat [eval $script]
+	    set t1 [clock clicks -milliseconds]
+	    set t [expr {$t1 - $t0}]
+	    set runq [lrange $runq 1 end]
+	    if {$repeat ne {} && $repeat} {
+		if {$fd eq {} || $repeat == 2} {
+		    # script returns 1 if it wants to be readded
+		    # file readers return 2 if they could do more straight away
+		    lappend runq [list $fd $script]
+		} else {
+		    fileevent $fd readable [list filereadable $fd $script]
+		}
+	    } elseif {$fd eq {}} {
+		unset isonrunq($script)
 	    }
-	} elseif {$fd eq {}} {
-	    unset isonrunq($script)
+	    set t0 $t1
+	    if {$t1 - $tstart >= 80} break
 	}
-	set t0 $t1
-	if {$t1 - $tstart >= 80} break
-    }
-    if {$runq ne {}} {
-	after idle dorunq
-    }
-}
-
-# Start off a git rev-list process and arrange to read its output
-proc start_rev_list {view} {
-    global startmsecs misordered curview
-    global commfd leftover tclencoding datemode
-    global viewargs viewfiles commitidx reorderbuf
-    global lookingforhead showlocalchanges
-    global vnexttoken
-
-    set startmsecs [clock clicks -milliseconds]
-    tsv::set vdisporder $view {}
-    tsv::set vcmitlisted $view {}
-    tsv::set vtokenlist $view {}
-    set vnexttoken($view) 1
-    set commitidx($view) 0
-    set reorderbuf($view) {}
-    set misordered($view) 0
-    set args $viewargs($view)
-    if {$viewfiles($view) ne {}} {
-	set args [concat $args "--" $viewfiles($view)]
-    }
-    set order "--topo-order"
-    if {$datemode} {
-	set order ""
-    }
-    if {[catch {
-	set fd [open [concat | git rev-list --header $order \
-			  --parents --boundary --default HEAD $args] r]
-    } err]} {
-	puts stderr "Error executing git rev-list: $err"
-	exit 1
-    }
-    set commfd($view) $fd
-    set leftover($view) {}
-    set lookingforhead $showlocalchanges
-    fconfigure $fd -blocking 0 -translation lf
-    if {$tclencoding != {}} {
-	fconfigure $fd -encoding $tclencoding
-    }
-    filerun $fd [list getcommitlines $fd $view]
-    nowbusy $view
-}
-
-proc stop_rev_list {} {
-    global commfd curview
-
-    if {![info exists commfd($curview)]} return
-    set fd $commfd($curview)
-    catch {
-	set pid [pid $fd]
-	exec kill $pid
-    }
-    catch {close $fd}
-    unset commfd($curview)
-}
-
-proc getcommits {} {
-    global phase canv mainfont curview
-
-    nowbusy layout
-    set phase getcommits
-    initlayout
-    start_rev_list $curview
-    show_status "Reading commits..."
-}
-
-# Each row is given a token, which is a series of integers,
-# in such a manner that tokens increase with row number, but don't
-# have to be reassigned when rows are inserted.
-
-# Compare two tokens, return -1, 0 or 1
-proc tokencmp {t1 t2 {i 0}} {
-    set comp 0
-    set t1len [llength $t1]
-    set t2len [llength $t2]
-    for {} {$i < $t1len && $i < $t2len} {incr i} {
-	if {[lindex $t1 $i] < [lindex $t2 $i]} {
-	    set comp -1
-	    break
-	}
-	if {[lindex $t1 $i] > [lindex $t2 $i]} {
-	    set comp 1
-	    break
+	if {$runq ne {}} {
+	    after idle dorunq
 	}
     }
-    if {$comp == 0} {
-	if {$t1len < $t2len} {
-	    set comp -1
-	} elseif {$t1len > $t2len} {
-	    set comp 1
-	}
-    }
-    return $comp
-}
 
-# This function finds the row number for an id by getting its token
-# and doing a binary search on the list of tokens.
-proc rowofcommit {view id} {
-    if {![tsv::exists ctok$view $id]} {
+    # Each row is given a token, which is a series of integers,
+    # in such a manner that tokens increase with row number, but don't
+    # have to be reassigned when rows are inserted.
+
+    # Compare two tokens, return -1, 0 or 1
+    proc tokencmp {t1 t2 {i 0}} {
+	set comp 0
+	set t1len [llength $t1]
+	set t2len [llength $t2]
+	for {} {$i < $t1len && $i < $t2len} {incr i} {
+	    if {[lindex $t1 $i] < [lindex $t2 $i]} {
+		set comp -1
+		break
+	    }
+	    if {[lindex $t1 $i] > [lindex $t2 $i]} {
+		set comp 1
+		break
+	    }
+	}
+	if {$comp == 0} {
+	    if {$t1len < $t2len} {
+		set comp -1
+	    } elseif {$t1len > $t2len} {
+		set comp 1
+	    }
+	}
+	return $comp
+    }
+
+    # This function finds the row number for an id by getting its token
+    # and doing a binary search on the list of tokens.
+    proc rowofcommit {view id} {
+	%ifnotthread% global ctok$view vtokenlist
+
+	if {![%tsvexists% ctok$view $id]} {
+	    return {}
+	}
+	set tok [%tsvget% ctok$view $id]
+	set tok0 [lindex $tok 0]
+	set toklen [llength $tok]
+	set llen [%tsvllength% vtokenlist $view]
+	set lo 0
+	set hi $llen
+	while {$lo < $hi} {
+	    set mid [expr {($lo + $hi) / 2}]
+	    set mt [%tsvlindex% vtokenlist $view $mid]
+	    set mt0 [lindex $mt 0]
+	    if {$tok0 < $mt0} {
+		set hi $mid
+	    } elseif {$tok0 > $mt0} {
+		set lo [expr {$mid + 1}]
+	    } else {
+		set mclen [llength $mt]
+		if {$toklen == 1} {
+		    if {[llength $mt] == 1} {
+			return $mid
+		    }
+		    set comp -1
+		} else {
+		    set comp [tokencmp $tok $mt 1]
+		    if {$comp == 0} {
+			return $mid
+		    }
+		}
+		if {$comp < 0} {
+		    set hi $mid
+		} else {
+		    set lo [expr {$mid + 1}]
+		}
+	    }
+	}
+	puts "oops token {$tok} not in list"
 	return {}
     }
-    set tok [tsv::get ctok$view $id]
-    set tok0 [lindex $tok 0]
-    set toklen [llength $tok]
-    set llen [tsv::llength vtokenlist $view]
-    set lo 0
-    set hi $llen
-    while {$lo < $hi} {
-	set mid [expr {($lo + $hi) / 2}]
-	set mt [tsv::lindex vtokenlist $view $mid]
-	set mt0 [lindex $mt 0]
-	if {$tok0 < $mt0} {
-	    set hi $mid
-	} elseif {$tok0 > $mt0} {
-	    set lo [expr {$mid + 1}]
+
+    proc shortids {ids} {
+	set res {}
+	foreach id $ids {
+	    if {[llength $id] > 1} {
+		lappend res [shortids $id]
+	    } elseif {[regexp {^[0-9a-f]{40}$} $id]} {
+		lappend res [string range $id 0 7]
+	    } else {
+		lappend res $id
+	    }
+	}
+	return $res
+    }
+}
+
+# The following procedures run in the thread that reads the git rev-list
+# output and lays out the graph.
+set lthreadstuff {
+    proc save_view {} {
+	global curview viewdata rowidlist rowoffsets idinlist
+	global rowlaidout rowoptim lnumcommits
+
+	set viewdata($curview) \
+	    [list $rowidlist $rowoffsets [array get idinlist] \
+		 $rowlaidout $rowoptim $lnumcommits]
+    }
+
+    proc restore_view {view} {
+	global viewdata rowidlist rowoffsets idinlist
+	global rowlaidout rowoptim lnumcommits
+
+	set rowidlist [lindex $viewdata($view) 0]
+	set rowoffsets [lindex $viewdata($view) 1]
+	array set idinlist [lindex $viewdata($view) 2]
+	set rowlaidout [lindex $viewdata($view) 3]
+	set rowoptim [lindex $viewdata($view) 4]
+	set lnumcommits [lindex $viewdata($view) 5]
+    }
+
+    proc start_layout {view} {
+	global curview viewdata
+
+	if {[info exists curview]} {
+	    if {$curview == $view} {
+		stop_rev_list
+		catch {tsv::unset children$view}
+		catch {tsv::unset parents$view}
+		catch {tsv::unset ctok$view}
+		catch {unset viewdata($view)}
+	    } else {
+		save_view
+	    }
+	}
+	set curview $view
+	initlayout
+	start_rev_list $view
+    }
+
+    proc layout_finished {} {
+	global rowoffsets idinlist
+
+	set rowoffsets {}
+	catch {unset idinlist}
+    }
+
+    proc switch_view {view} {
+	global curview viewdata lnumcommits commitidx
+
+	if {[info exists curview]} {
+	    if {$view == $curview} return
+	    save_view
+	}
+	set curview $view
+	if {[info exists viewdata($view)]} {
+	    restore_view $view
 	} else {
-	    set mclen [llength $mt]
-	    if {$toklen == 1} {
-		if {[llength $mt] == 1} {
-		    return $mid
+	    initlayout
+	}
+	if {$lnumcommits < $commitidx($view)} {
+	    run chewcommits
+	}
+    }
+
+    # Start off a git rev-list process and arrange to read its output
+    proc start_rev_list {view} {
+	global startms misordered curview
+	global commfd leftover tclencoding datemode
+	global commitidx reorderbuf
+	global lviewgen
+	global vnexttoken disporder vtokenlist vcmitlisted
+
+	set startms($view) [clock clicks -milliseconds]
+	set disporder($view) {}
+	%iflthread% tsv::set disporder $view {}
+	set vcmitlisted($view) {}
+	%iflthread% tsv::set vcmitlisted $view {}
+	set vtokenlist($view) {}
+	%iflthread% tsv::set vtokenlist $view {}
+	set vnexttoken($view) 1
+	set commitidx($view) 0
+	set reorderbuf($view) {}
+	set misordered($view) 0
+	if {![info exists lviewgen($view)]} {
+	    set lviewgen($view) 1
+	} else {
+	    incr lviewgen($view)
+	}
+
+	set args [tsv::get viewargs $view]
+	if {[tsv::get viewfiles $view] ne {}} {
+	    set args [concat $args "--" [tsv::get viewfiles $view]]
+	}
+	set order "--topo-order"
+	if {$datemode} {
+	    set order ""
+	}
+	if {[catch {
+	    set fd [open [concat | git rev-list --header $order \
+			      --parents --boundary --default HEAD $args] r]
+	} err]} {
+	    puts stderr "Error executing git rev-list: $err"
+	    exit 1
+	}
+	set commfd($view) $fd
+	set leftover($view) {}
+	fconfigure $fd -blocking 0 -translation lf
+	if {$tclencoding != {}} {
+	    fconfigure $fd -encoding $tclencoding
+	}
+	filerun $fd [list getcommitlines $fd $view]
+    }
+
+    proc stop_rev_list {} {
+	global commfd curview
+
+	if {![info exists commfd($curview)]} return
+	set fd $commfd($curview)
+	catch {
+	    set pid [pid $fd]
+	    exec kill $pid
+	}
+	catch {close $fd}
+	unset commfd($curview)
+    }
+
+    # pull out row $row from disporder etc.
+    proc extractrow {view row} {
+	global commitidx disporder vtokenlist
+
+	set id [lindex $disporder($view) $row]
+	set disporder($view) [lreplace $disporder($view) $row $row]
+	%iflthread% tsv::lpop disporder $view $row
+	set vtokenlist($view) [lreplace $vtokenlist($view) $row $row]
+	%iflthread% tsv::lpop vtokenlist $view $row
+	tsv::unset ctok$view $id
+	incr commitidx($view) -1
+	return [list $id $l]
+    }
+
+    # move the first $fin entries in the reorder buffer to the
+    # disporder etc. lists
+    proc flushreorder {rebuf view fin} {
+	global commitidx reorderbuf
+	global vnexttoken disporder lviewgen vtokenlist vcmitlisted
+	%ifnotlthread% global parents$view ctok$view
+
+	if {$fin <= 0} {
+	    set reorderbuf($view) $rebuf
+	    return
+	}
+	set reorderbuf($view) [lrange $rebuf $fin end]
+	set rebuf [lrange $rebuf 0 [expr {$fin-1}]]
+	set oldlen $commitidx($view)
+	incr commitidx($view) [llength $rebuf]
+	set tok $vnexttoken($view)
+	foreach info $rebuf {
+	    set id [lindex $info 0]
+	    lappend disporder($view) $id
+	    lappend vcmitlisted($view) [lindex $info 2]
+	    lappend vtokenlist($view) $tok
+	    %tsvset% parents$view $id [lindex $info 1]
+	    %tsvset% ctok$view $id $tok
+	    incr tok
+	}
+	set vnexttoken($view) $tok
+	%iflthread% eval tsv::linsert disporder $view end \
+	    [lrange $disporder($view) $oldlen end]
+	%iflthread% eval tsv::linsert vtokenlist $view end \
+	    [lrange $vtokenlist($view) $oldlen end]
+	%iflthread% eval tsv::linsert vcmitlisted $view end \
+	    [lrange $vcmitlisted($view) $oldlen end]
+	do_main newcommits $view $commitidx($view) $lviewgen($view)
+    }
+
+    # do a topological sort of the elements in l
+    # each element is a list of ID, parents, children, listed flag
+    proc topo_sort {l} {
+	# simple, stupid sorting algorithm: keep moving commits back before
+	# their earliest parent until we get to the end of the list.
+	for {set i 0} {$i < [llength $l]} {incr i} {
+	    set j $i
+	    set info [lindex $l $i]
+	    foreach p [lindex $info 1] {
+		if {[info exists index($p)] && $index($p) < $j} {
+		    set j $index($p)
 		}
-		set comp -1
-	    } else {
-		set comp [tokencmp $tok $mt 1]
-		if {$comp == 0} {
-		    return $mid
+	    }
+	    if {$j < $i} {
+		# move this guy back to position $j
+		set l [linsert [lreplace $l $i $i] $j $info]
+		for {} {$i > $j} {incr i -1} {
+		    unset index([lindex $l $i 0])
 		}
 	    }
-	    if {$comp < 0} {
-		set hi $mid
-	    } else {
-		set lo [expr {$mid + 1}]
-	    }
+	    set index([lindex $info 0]) $i
 	}
+	return $l
     }
-    puts "oops token {$tok} not in list"
-    return {}
-}
 
-# pull out row $row from vdisporder etc.
-proc extractrow {view row} {
-    global hlview commitidx
+    # called when input from the git rev-list process is available
+    proc getcommitlines {fd view}  {
+	global leftover commfd reorderbuf reorder_delay
+	global misordered lviewgen
+	global curview rowlaidout
+	%ifnotthread% global children$view ctok$view cdata
 
-    set id [tsv::lpop vdisporder $view $row]
-    set l [tsv::lpop vcmitlisted $view $row]
-    tsv::lpop vtokenlist $view $row]
-    tsv::unset ctok$view $id
-    if {[info exists hlview] && $view == $hlview && $row < $vhl_done} {
-	incr vhl_done -1
-    }
-    incr commitidx($view) -1
-    return [list $id $l]
-}
-
-# move the first $fin entries in the reorder buffer to the
-# vdisporder etc. lists
-proc flushreorder {rebuf view fin} {
-    global commitidx reorderbuf curview
-    global vnexttoken
-
-    if {$fin <= 0} {
-	set reorderbuf($view) $rebuf
-	return
-    }
-    set reorderbuf($view) [lrange $rebuf $fin end]
-    set rebuf [lrange $rebuf 0 [expr {$fin-1}]]
-    incr commitidx($view) [llength $rebuf]
-    set tok $vnexttoken($view)
-    foreach info $rebuf {
-	set id [lindex $info 0]
-	tsv::lpush vdisporder $view $id end
-	tsv::set parents$view $id [lindex $info 1]
-	tsv::lpush vcmitlisted $view [lindex $info 2] end
-	tsv::set ctok$view $id $tok
-	tsv::lpush vtokenlist $view $tok end
-	incr tok
-    }
-    set vnexttoken($view) $tok
-}
-
-# do a topological sort of the elements in l
-# each element is a list of ID, parents, children, listed flag
-proc topo_sort {l} {
-    # simple, stupid sorting algorithm: keep moving commits back before
-    # their earliest parent until we get to the end of the list.
-    for {set i 0} {$i < [llength $l]} {incr i} {
-	set j $i
-	set info [lindex $l $i]
-	foreach p [lindex $info 1] {
-	    if {[info exists index($p)] && $index($p) < $j} {
-		set j $index($p)
+	set rebuf $reorderbuf($view)
+	set stuff [read $fd 500000]
+	if {$stuff == {}} {
+	    if {![eof $fd]} {
+		return 1
 	    }
-	}
-	if {$j < $i} {
-	    # move this guy back to position $j
-	    set l [linsert [lreplace $l $i $i] $j $info]
-	    for {} {$i > $j} {incr i -1} {
-		unset index([lindex $l $i 0])
-	    }
-	}
-	set index([lindex $info 0]) $i
-    }
-    return $l
-}
-
-# called when input from the git rev-list process is available
-proc getcommitlines {fd view}  {
-    global leftover commfd reorderbuf reorder_delay
-    global misordered
-    global curview hlview rowlaidout
-
-    set rebuf $reorderbuf($view)
-    set stuff [read $fd 500000]
-    if {$stuff == {}} {
-	if {![eof $fd]} {
-	    return 1
-	}
-	global viewname
-	flushreorder $rebuf $view [llength $rebuf]
-	unset commfd($view)
-	notbusy $view
-	# set it blocking so we wait for the process to terminate
-	fconfigure $fd -blocking 1
-	if {[catch {close $fd} err]} {
-	    set fv {}
-	    if {$view != $curview} {
-		set fv " for the \"$viewname($view)\" view"
-	    }
-	    if {[string range $err 0 4] == "usage"} {
-		set err "Gitk: error reading commits$fv:\
+	    flushreorder $rebuf $view [llength $rebuf]
+	    unset commfd($view)
+	    # set it blocking so we wait for the process to terminate
+	    fconfigure $fd -blocking 1
+	    set err {}
+	    if {[catch {close $fd} err]} {
+		set fv {}
+		set vname [tsv::get viewname $view]
+		if {$view != $curview} {
+		    set fv " for the \"$vname\" view"
+		}
+		if {[string range $err 0 4] == "usage"} {
+		    set err "Gitk: error reading commits$fv:\
 			bad arguments to git rev-list."
-		if {$viewname($view) eq "Command line"} {
-		    append err \
+		    if {$vname eq "Command line"} {
+			append err \
 			"  (Note: arguments to gitk are passed to git rev-list\
 			 to allow selection of commits to be displayed.)"
+		    }
+		} else {
+		    set err "Error reading commits$fv: $err"
+		}
+	    }
+	    do_main viewdone $view $err $lviewgen($view)
+	    if {$view == $curview} {
+		run chewcommits
+	    }
+	    return 0
+	}
+	set i 0
+	foreach x $rebuf {
+	    set seenit([lindex $x 0]) $i
+	    incr i
+	}
+	set start 0
+	set gotsome 0
+	while 1 {
+	    set i [string first "\0" $stuff $start]
+	    if {$i < 0} {
+		append leftover($view) [string range $stuff $start end]
+		break
+	    }
+	    if {$start == 0} {
+		set cmit $leftover($view)
+		append cmit [string range $stuff 0 [expr {$i - 1}]]
+		set leftover($view) {}
+	    } else {
+		set cmit [string range $stuff $start [expr {$i - 1}]]
+	    }
+	    set start [expr {$i + 1}]
+	    set j [string first "\n" $cmit]
+	    set ok 0
+	    set listed 1
+	    if {$j >= 0} {
+		set ids [string range $cmit 0 [expr {$j - 1}]]
+		if {[string range $ids 0 0] == "-"} {
+		    set listed 0
+		    set ids [string range $ids 1 end]
+		}
+		set ok 1
+		foreach id $ids {
+		    if {[string length $id] != 40} {
+			set ok 0
+			break
+		    }
+		}
+	    }
+	    if {!$ok} {
+		set shortcmit $cmit
+		if {[string length $shortcmit] > 80} {
+		    set shortcmit "[string range $shortcmit 0 80]..."
+		}
+		error_popup "Can't parse git rev-list output: {$shortcmit}"
+		exit 1
+	    }
+	    set id [lindex $ids 0]
+	    if {![%tsvexists% children$view $id]} {
+		%tsvset% children$view $id {}
+	    }
+	    if {$listed} {
+		set olds [lrange $ids 1 end]
+		set i 0
+		foreach p $olds {
+		    if {$i == 0 || [lsearch -exact $olds $p] >= $i} {
+			%tsvappend% children$view $p $id
+		    }
+		    incr i
 		}
 	    } else {
-		set err "Error reading commits$fv: $err"
+		set olds {}
 	    }
-	    error_popup $err
+	    %tsvset% cdata $id [string range $cmit [expr {$j + 1}] end]
+	    set seenit($id) [llength $rebuf]
+	    lappend rebuf [list $id $olds $listed]
+	    set gotsome 1
+
+	    # now check if we have already seen any of the parents already...
+	    set pinfo {}
+	    for {set i 0} {$i < [llength $olds]} {incr i} {
+		set p [lindex $olds $i]
+		if {[%tsvexists% ctok$view $p]} {
+		    # got parent before child, parent has exited reorderbuf
+		    # pull it out of the disporder etc. lists and
+		    # append it to the reorderbuf
+		    if {!$misordered($view)} {
+			set misordered($view) 1
+		    }
+		    set r [rowofcommit $view $p]
+		    do_main truncatecommits $view $r $lviewgen($view)
+		    set info [extractrow $view $r]
+		    # bump up reorder_delay to try to avoid this in future
+		    set reorder_delay 500
+		} elseif {[info exists seenit($p)]} {
+		    # parent came first but is still in reorderbuf
+		    # pull the parent entry out and append it again later
+		    set r $seenit($p)
+		    set info [lindex $rebuf $r]
+		    set rebuf [lreplace $rebuf $r $r]
+		    for {set l [llength $rebuf]} {$r < $l} {incr r} {
+			set seenit([lindex $rebuf $r 0]) $r
+		    }
+		    unset seenit($p)
+		} else {
+		    continue
+		}
+		lappend pinfo $info
+		# now make sure we check all of p's parents
+		foreach pp [lindex $info 1] {
+		    if {[lsearch -exact $olds $pp] < 0} {
+			lappend olds $pp
+		    }
+		}
+	    }
+	    if {$pinfo ne {}} {
+		# append parents that came earlier, in topological order
+		foreach info [topo_sort $pinfo] {
+		    set p [lindex $info 0]
+		    set seenit($p) [llength $rebuf]
+		    lappend rebuf $info
+		}
+	    }
 	}
-	if {$view == $curview} {
-	    run chewcommits $view
+	if {$gotsome} {
+	    flushreorder $rebuf $view [expr {[llength $rebuf]-$reorder_delay}]
+	    if {$view == $curview} {
+		run chewcommits
+	    }
+	}
+	return 2
+    }
+
+    proc chewcommits {} {
+	global curview misordered commfd curview lviewgen
+
+	set more 0
+	set allread [expr {![info exists commfd($curview)]}]
+	set tlimit [expr {[clock clicks -milliseconds] + 50}]
+	if {$allread && $misordered($curview)} {
+	    # misordering was detected that we couldn't fix in the reorder
+	    # buffer; re-do the layout from scratch
+	    do_main showmisordered $curview $lviewgen($curview)
+	    initlayout
+	    # note initlayout clears misordered($curview)
+	}
+	if {!$misordered($curview)} {
+	    set more [layoutmore $tlimit $allread]
+	    if {$allread && !$more} {
+		global commitidx lnumcommits startms
+		if {$commitidx($curview) > 0} {
+		    set ms [expr {[clock clicks -milliseconds] \
+				      - $startms($curview)}]
+		    #puts "overall $ms ms for $lnumcommits commits"
+		}
+	    }
+	}
+	return $more
+    }
+
+    proc layoutmore {tmax allread} {
+	global rowlaidout rowoptim commitidx lnumcommits optim_delay
+	global curview rowidlist idinlist lviewgen
+	%ifnotthread% global options
+
+	set showlast 0
+	set showdelay $optim_delay
+	set optdelay [expr {[%tsvget% options uparrowlen] + 1}]
+	while {1} {
+	    if {$rowoptim - $showdelay > $lnumcommits} {
+		set canshow [expr {$rowoptim - $showdelay}]
+		%iflthread% eval tsv::linsert vrowidlist $curview end \
+		    [lrange $rowidlist $lnumcommits [expr {$canshow - 1}]]
+		do_main showstuff $curview $canshow $showlast \
+		    $lviewgen($curview)
+		set lnumcommits $canshow
+	    } elseif {$rowlaidout - $optdelay > $rowoptim} {
+		set nr [expr {$rowlaidout - $optdelay - $rowoptim}]
+		if {$nr > 100} {
+		    set nr 100
+		}
+		optimize_rows $rowoptim 0 [expr {$rowoptim + $nr}]
+		incr rowoptim $nr
+	    } elseif {$commitidx($curview) > $rowlaidout} {
+		set nr [expr {$commitidx($curview) - $rowlaidout}]
+		# may need to increase this threshold if uparrowlen or
+		# mingaplen are increased...
+		if {$nr > 150} {
+		    set nr 150
+		}
+		set row $rowlaidout
+		set rowlaidout [layoutrows $row [expr {$row + $nr}] $allread]
+		if {$rowlaidout == $row} {
+		    return 0
+		}
+	    } elseif {$allread} {
+		set optdelay 0
+		set nrows $commitidx($curview)
+		if {[lindex $rowidlist $nrows] ne {} ||
+		    [array names idinlist] ne {}} {
+		    layouttail
+		    set rowlaidout $commitidx($curview)
+		} elseif {$rowoptim == $nrows} {
+		    set showdelay 0
+		    set showlast 1
+		    if {$lnumcommits == $nrows} {
+			layout_finished
+			return 0
+		    }
+		}
+	    } else {
+		return 0
+	    }
+	    if {$tmax ne {} && [clock clicks -milliseconds] >= $tmax} {
+		return 1
+	    }
+	}
+    }
+
+    proc initlayout {} {
+	global rowidlist rowoffsets rowlaidout rowoptim
+	global idinlist rowchk
+	global lnumcommits
+	global curview misordered
+
+	set rowlaidout 0
+	set rowoptim 0
+	set lnumcommits 0
+	set rowidlist {{}}
+	set rowoffsets {{}}
+	catch {unset idinlist}
+	catch {unset rowchk}
+	catch {tsv::unset idrowranges$curview}
+	set misordered($curview) 0
+    }
+
+    proc incrange {l x o} {
+	set n [llength $l]
+	while {$x < $n} {
+	    set e [lindex $l $x]
+	    if {$e ne {}} {
+		lset l $x [expr {$e + $o}]
+	    }
+	    incr x
+	}
+	return $l
+    }
+
+    proc ntimes {n o} {
+	set ret {}
+	for {} {$n > 0} {incr n -1} {
+	    lappend ret $o
+	}
+	return $ret
+    }
+
+    proc usedinrange {id l1 l2} {
+	global curview disporder
+	%ifnotthread% global ctok$curview children$curview
+
+	set id1 [lindex $disporder($curview) $l1]
+	set tok1 [%tsvget% ctok$curview $id1]
+	set id2 [lindex $disporder($curview) $l2]
+	set tok2 [%tsvget% ctok$curview $id2]
+	if {[%tsvexists% ctok$curview $id]} {
+	    set t [%tsvget% ctok$curview $id]
+	    if {[tokencmp $tok1 $t] <= 0 && [tokencmp $t $tok2] <= 0} {
+		set r [rowofcommit $curview $id]
+		return [expr {$r - $l1 + 1}]
+	    }
+	}
+	set kids [%tsvget% children$curview $id]
+	foreach c $kids {
+	    if {[%tsvexists% ctok$curview $c]} {
+		set t [%tsvget% ctok$curview $c]
+		if {[tokencmp $tok1 $t] <= 0 && [tokencmp $t $tok2] <= 0} {
+		    set r [rowofcommit $curview $c]
+		    return [expr {$r - $l1 + 1}]
+		}
+	    }
 	}
 	return 0
     }
-    set i 0
-    foreach x $rebuf {
-	set seenit([lindex $x 0]) $i
-	incr i
-    }
-    set start 0
-    set gotsome 0
-    while 1 {
-	set i [string first "\0" $stuff $start]
-	if {$i < 0} {
-	    append leftover($view) [string range $stuff $start end]
-	    break
-	}
-	if {$start == 0} {
-	    set cmit $leftover($view)
-	    append cmit [string range $stuff 0 [expr {$i - 1}]]
-	    set leftover($view) {}
-	} else {
-	    set cmit [string range $stuff $start [expr {$i - 1}]]
-	}
-	set start [expr {$i + 1}]
-	set j [string first "\n" $cmit]
-	set ok 0
-	set listed 1
-	if {$j >= 0} {
-	    set ids [string range $cmit 0 [expr {$j - 1}]]
-	    if {[string range $ids 0 0] == "-"} {
-		set listed 0
-		set ids [string range $ids 1 end]
-	    }
-	    set ok 1
-	    foreach id $ids {
-		if {[string length $id] != 40} {
-		    set ok 0
+
+    proc makeuparrow {oid x y z} {
+	global rowidlist rowoffsets curview disporder
+	%ifnotlthread% global idrowranges$curview options
+
+	set uparrowlen [%tsvget% options uparrowlen]
+	for {set i 1} {$i < $uparrowlen && $y > 1} {incr i} {
+	    incr y -1
+	    incr x $z
+	    set off0 [lindex $rowoffsets $y]
+	    for {set x0 $x} {1} {incr x0} {
+		if {$x0 >= [llength $off0]} {
+		    set x0 [llength [lindex $rowoffsets [expr {$y-1}]]]
+		    break
+		}
+		set z [lindex $off0 $x0]
+		if {$z ne {}} {
+		    incr x0 $z
 		    break
 		}
 	    }
+	    set z [expr {$x0 - $x}]
+	    lset rowidlist $y [linsert [lindex $rowidlist $y] $x $oid]
+	    lset rowoffsets $y [linsert [lindex $rowoffsets $y] $x $z]
 	}
-	if {!$ok} {
-	    set shortcmit $cmit
-	    if {[string length $shortcmit] > 80} {
-		set shortcmit "[string range $shortcmit 0 80]..."
-	    }
-	    error_popup "Can't parse git rev-list output: {$shortcmit}"
-	    exit 1
-	}
-	set id [lindex $ids 0]
-	if {![tsv::exists children$view $id]} {
-	    tsv::set children$view $id {}
-	}
-	if {$listed} {
-	    set olds [lrange $ids 1 end]
-	    set i 0
-	    foreach p $olds {
-		if {$i == 0 || [lsearch -exact $olds $p] >= $i} {
-		    tsv::lpush children$view $p $id end
-		}
-		incr i
-	    }
-	} else {
-	    set olds {}
-	}
-	tsv::set cdata $id [string range $cmit [expr {$j + 1}] end]
-	set seenit($id) [llength $rebuf]
-	lappend rebuf [list $id $olds $listed]
-	set gotsome 1
+	set tmp [lreplace [lindex $rowoffsets $y] $x $x {}]
+	lset rowoffsets $y [incrange $tmp [expr {$x+1}] -1]
+	%tsvappend% idrowranges$curview $oid [lindex $disporder($curview) $y]
+    }
 
-	# now check if we have already seen any of the parents already...
-	set pinfo {}
-	for {set i 0} {$i < [llength $olds]} {incr i} {
-	    set p [lindex $olds $i]
-	    if {[tsv::exists ctok$view $p]} {
-		# got parent before child, parent has exited reorderbuf
-		# pull it out of the vdisporder etc. lists and
-		# append it to the reorderbuf
-		if {!$misordered($view)} {
-		    set misordered($view) 1
+    proc layoutrows {row endrow last} {
+	global rowidlist rowoffsets disporder
+	global commitidx curview idinlist rowchk
+	%ifnotlthread% global parents$curview children$curview \
+	    idrowranges$curview options
+
+	set maxwidth [%tsvget% options maxwidth]
+	set uparrowlen [%tsvget% options uparrowlen]
+	set downarrowlen [%tsvget% options downarrowlen]
+	set mingaplen [%tsvget% options mingaplen]
+	set idlist [lindex $rowidlist $row]
+	set offs [lindex $rowoffsets $row]
+	while {$row < $endrow} {
+	    set id [lindex $disporder($curview) $row]
+	    set oldolds {}
+	    set newolds {}
+	    foreach p [%tsvget% parents$curview $id] {
+		if {![info exists idinlist($p)]} {
+		    lappend newolds $p
+		} elseif {!$idinlist($p)} {
+		    lappend oldolds $p
 		}
-		set r [rowofcommit $view $p]
-		if {$view == $curview} {
-		    trim_display $r
+	    }
+	    set nev [expr {[llength $idlist] + [llength $newolds]
+			   + [llength $oldolds] - $maxwidth + 1}]
+	    if {$nev > 0} {
+		if {!$last &&
+		    $row + $uparrowlen + $mingaplen >= $commitidx($curview)} break
+		for {set x [llength $idlist]} {[incr x -1] >= 0} {} {
+		    set i [lindex $idlist $x]
+		    if {![info exists rowchk($i)] || $row >= $rowchk($i)} {
+			set r [usedinrange $i [expr {$row - $downarrowlen}] \
+				   [expr {$row + $uparrowlen + $mingaplen}]]
+			if {$r == 0} {
+			    set idlist [lreplace $idlist $x $x]
+			    set offs [lreplace $offs $x $x]
+			    set offs [incrange $offs $x 1]
+			    set idinlist($i) 0
+			    set rm1 [expr {$row - 1}]
+			    %tsvappend% idrowranges$curview $i \
+				[lindex $disporder($curview) $rm1]
+			    if {[incr nev -1] <= 0} break
+			    continue
+			}
+			set rowchk($id) [expr {$row + $r}]
+		    }
 		}
-		set info [extractrow $view $r]
-		# bump up reorder_delay to try to avoid this in future
-		set reorder_delay 500
-	    } elseif {[info exists seenit($p)]} {
-		# parent came first but is still in reorderbuf
-		# pull the parent entry out and append it again later
-		set r $seenit($p)
-		set info [lindex $rebuf $r]
-		set rebuf [lreplace $rebuf $r $r]
-		for {set l [llength $rebuf]} {$r < $l} {incr r} {
-		    set seenit([lindex $rebuf $r 0]) $r
+		lset rowidlist $row $idlist
+		lset rowoffsets $row $offs
+	    }
+	    set col [lsearch -exact $idlist $id]
+	    if {$col < 0} {
+		set col [llength $idlist]
+		lappend idlist $id
+		lset rowidlist $row $idlist
+		set z {}
+		if {[%tsvget% children$curview $id] ne {}} {
+		    set z [expr {[llength [lindex $rowidlist [expr {$row-1}]]] - $col}]
+		    unset idinlist($id)
 		}
-		unset seenit($p)
+		lappend offs $z
+		lset rowoffsets $row $offs
+		if {$z ne {}} {
+		    makeuparrow $id $col $row $z
+		}
 	    } else {
-		continue
+		unset idinlist($id)
 	    }
-	    lappend pinfo $info
-	    # now make sure we check all of p's parents
-	    foreach pp [lindex $info 1] {
-		if {[lsearch -exact $olds $pp] < 0} {
-		    lappend olds $pp
+	    set ranges {}
+	    if {[%tsvexists% idrowranges$curview $id]} {
+		%tsvappend% idrowranges$curview $id $id
+	    }
+	    incr row
+	    set offs [ntimes [llength $idlist] 0]
+	    set l [llength $newolds]
+	    set idlist [eval lreplace \$idlist $col $col $newolds]
+	    set o 0
+	    if {$l != 1} {
+		set offs [lrange $offs 0 [expr {$col - 1}]]
+		foreach x $newolds {
+		    lappend offs {}
+		    incr o -1
+		}
+		incr o
+		set tmp [expr {[llength $idlist] - [llength $offs]}]
+		if {$tmp > 0} {
+		    set offs [concat $offs [ntimes $tmp $o]]
+		}
+	    } else {
+		lset offs $col {}
+	    }
+	    foreach i $newolds {
+		set idinlist($i) 1
+		%tsvset% idrowranges$curview $i $id
+	    }
+	    incr col $l
+	    foreach oid $oldolds {
+		set idinlist($oid) 1
+		set idlist [linsert $idlist $col $oid]
+		set offs [linsert $offs $col $o]
+		makeuparrow $oid $col $row $o
+		incr col
+	    }
+	    lappend rowidlist $idlist
+	    lappend rowoffsets $offs
+	}
+	return $row
+    }
+
+    proc addextraid {id row} {
+	global vnexttoken disporder
+	global commitidx
+	global curview
+	%ifnotthread% global parents$curview children$curview ctok$curview
+
+	incr commitidx($curview)
+	lappend disporder($curview) $id
+	tsv::lpush vcmitlisted $curview 0 end
+	%tsvset% parents$curview $id {}
+	%tsvset% ctok$curview $id $vnexttoken($curview)
+	incr vnexttoken($curview)
+	if {![%tsvexists% children$curview $id]} {
+	    %tsvset% children$curview $id {}
+	}
+    }
+
+    proc layouttail {} {
+	global rowidlist rowoffsets idinlist commitidx curview
+	%ifnotlthread% global idrowranges$curview
+
+	set row $commitidx($curview)
+	set idlist [lindex $rowidlist $row]
+	while {$idlist ne {}} {
+	    set col [expr {[llength $idlist] - 1}]
+	    set id [lindex $idlist $col]
+	    addextraid $id $row
+	    unset idinlist($id)
+	    %tsvappend% idrowranges$curview $id $id
+	    incr row
+	    set offs [ntimes $col 0]
+	    set idlist [lreplace $idlist $col $col]
+	    lappend rowidlist $idlist
+	    lappend rowoffsets $offs
+	}
+
+	foreach id [array names idinlist] {
+	    unset idinlist($id)
+	    addextraid $id $row
+	    lset rowidlist $row [list $id]
+	    lset rowoffsets $row 0
+	    makeuparrow $id 0 $row 0
+	    %tsvappend% idrowranges$curview $id $id
+	    incr row
+	    lappend rowidlist {}
+	    lappend rowoffsets {}
+	}
+    }
+
+    proc insert_pad {row col npad} {
+	global rowidlist rowoffsets curview
+
+	set pad [ntimes $npad {}]
+	lset rowidlist $row [eval linsert [list [lindex $rowidlist $row]] $col $pad]
+	set tmp [eval linsert [list [lindex $rowoffsets $row]] $col $pad]
+	lset rowoffsets $row [incrange $tmp [expr {$col + $npad}] [expr {-$npad}]]
+    }
+
+    proc optimize_rows {row col endrow} {
+	global rowidlist rowoffsets curview disporder
+	global children$curview
+
+	for {} {$row < $endrow} {incr row} {
+	    set idlist [lindex $rowidlist $row]
+	    set offs [lindex $rowoffsets $row]
+	    set haspad 0
+	    for {} {$col < [llength $offs]} {incr col} {
+		set id [lindex $idlist $col]
+		if {$id eq {}} {
+		    set haspad 1
+		    continue
+		}
+		set z [lindex $offs $col]
+		if {$z eq {}} continue
+		set isarrow 0
+		set x0 [expr {$col + $z}]
+		set y0 [expr {$row - 1}]
+		set z0 [lindex $rowoffsets $y0 $x0]
+		if {$z0 eq {}} {
+		    set kid [lindex $disporder($curview) [expr {$row - 2}]]
+		    if {[%tsvsearch% children$curview $id $kid] < 0} {
+			set isarrow 1
+		    }
+		}
+		# Looking at lines from this row to the previous row,
+		# make them go straight up if they end in an arrow on
+		# the previous row; otherwise make them go straight up
+		# or at 45 degrees.
+		if {$z < -1 || ($z < 0 && $isarrow)} {
+		    # Line currently goes left too much;
+		    # insert pads in the previous row, then optimize it
+		    set npad [expr {-1 - $z + $isarrow}]
+		    set offs [incrange $offs $col $npad]
+		    insert_pad $y0 $x0 $npad
+		    if {$y0 > 0} {
+			optimize_rows $y0 $x0 $row
+		    }
+		    set z [lindex $offs $col]
+		    set x0 [expr {$col + $z}]
+		    set z0 [lindex $rowoffsets $y0 $x0]
+		} elseif {$z > 1 || ($z > 0 && $isarrow)} {
+		    # Line currently goes right too much;
+		    # insert pads in this line and adjust the next's rowoffsets
+		    set npad [expr {$z - 1 + $isarrow}]
+		    set y1 [expr {$row + 1}]
+		    set offs2 [lindex $rowoffsets $y1]
+		    set x1 -1
+		    foreach z $offs2 {
+			incr x1
+			if {$z eq {} || $x1 + $z < $col} continue
+			if {$x1 + $z > $col} {
+			    incr npad
+			}
+			lset rowoffsets $y1 [incrange $offs2 $x1 $npad]
+			break
+		    }
+		    set pad [ntimes $npad {}]
+		    set idlist [eval linsert \$idlist $col $pad]
+		    set tmp [eval linsert \$offs $col $pad]
+		    incr col $npad
+		    set offs [incrange $tmp $col [expr {-$npad}]]
+		    set z [lindex $offs $col]
+		    set haspad 1
+		}
+		if {$z0 eq {} && !$isarrow} {
+		    # this line links to its first child on row $row-2
+		    set rm2 [expr {$row - 2}]
+		    set id [lindex $disporder($curview) $rm2]
+		    set xc [lsearch -exact [lindex $rowidlist $rm2] $id]
+		    if {$xc >= 0} {
+			set z0 [expr {$xc - $x0}]
+		    }
+		}
+		# avoid lines jigging left then immediately right
+		if {$z0 ne {} && $z < 0 && $z0 > 0} {
+		    insert_pad $y0 $x0 1
+		    set offs [incrange $offs $col 1]
+		    optimize_rows $y0 [expr {$x0 + 1}] $row
 		}
 	    }
-	}
-	if {$pinfo ne {}} {
-	    # append parents that came earlier, in topological order
-	    foreach info [topo_sort $pinfo] {
-		set p [lindex $info 0]
-		set seenit($p) [llength $rebuf]
-		lappend rebuf $info
+	    if {!$haspad} {
+		set o {}
+		# Find the first column that doesn't have a line going right
+		for {set col [llength $idlist]} {[incr col -1] >= 0} {} {
+		    set o [lindex $offs $col]
+		    if {$o eq {}} {
+			# check if this is the link to the first child
+			set id [lindex $idlist $col]
+			set y0 [expr {$row - 1}]
+			set kid [lindex $disporder($curview) $y0]
+			if {[%tsvsearch% children$curview $id $kid] >= 0} {
+			    # it is, work out offset to child
+			    set x0 [lsearch -exact [lindex $rowidlist $y0] $kid]
+			    if {$x0 >= 0} {
+				set o [expr {$x0 - $col}]
+			    }
+			}
+		    }
+		    if {$o eq {} || $o <= 0} break
+		}
+		# Insert a pad at that column as long as it has a line and
+		# isn't the last column, and adjust the next row' offsets
+		if {$o ne {} && [incr col] < [llength $idlist]} {
+		    set y1 [expr {$row + 1}]
+		    set offs2 [lindex $rowoffsets $y1]
+		    set x1 -1
+		    foreach z $offs2 {
+			incr x1
+			if {$z eq {} || $x1 + $z < $col} continue
+			lset rowoffsets $y1 [incrange $offs2 $x1 1]
+			break
+		    }
+		    set idlist [linsert $idlist $col {}]
+		    set tmp [linsert $offs $col {}]
+		    incr col
+		    set offs [incrange $tmp $col -1]
+		}
 	    }
+	    lset rowidlist $row $idlist
+	    lset rowoffsets $row $offs
+	    set col 0
 	}
     }
-    if {$gotsome} {
-	flushreorder $rebuf $view [expr {[llength $rebuf] - $reorder_delay}]
-	run chewcommits $view
-    }
-    return 2
+
+    set optim_delay 16
+    set reorder_delay 10
 }
 
-proc chewcommits {view} {
-    global curview misordered hlview commfd
-    global selectedline pending_select currentid
+proc getcommits {view} {
+    global phase canv mainfont viewstate viewgen curview
+    global lookingforhead 
 
-    set more 0
-    if {$view == $curview} {
-	set allread [expr {![info exists commfd($view)]}]
-	set tlimit [expr {[clock clicks -milliseconds] + 50}]
-	if {$allread && $misordered($view)} {
-	    # misordering was detected that we couldn't fix in the reorder
-	    # buffer; re-do the layout from scratch
-	    if {[info exists selectedline]} {
-		set pending_select $currentid
-		unset selectedline
-	    }
-	    # note show_status does clear_display
-	    show_status "Redoing layout due to misordered commits"
-	    initlayout
-	    set misordered($curview) 0
-	}
-	if {!$misordered($view)} {
-	    set more [layoutmore $tlimit $allread]
-	    if {$allread && !$more} {
-		global nullid commitidx phase
-		global numcommits startmsecs
+    nowbusy layout
+    nowbusy $view
+    set phase getcommits
+    set viewstate($view) 0
+    do_layout start_layout $view
+    init_screen
+    show_status "Reading commits..."
+    if {![info exists viewgen($view)]} {
+	set viewgen($view) 1
+    } else {
+	incr viewgen($view)
+    }
+    set curview $view
+    set lookingforhead [tsv::get options showlocalchanges]
+}
 
-		if {[info exists pending_select]} {
-		    set row [expr {[tsv::lindex vdisporder $curview 0] eq $nullid}]
-		    selectline $row 1
-		}
-		if {$commitidx($curview) > 0} {
-		    #set ms [expr {[clock clicks -milliseconds] - $startmsecs}]
-		    #puts "overall $ms ms for $numcommits commits"
-		} else {
-		    show_status "No commits selected"
-		}
-		notbusy layout
-		set phase {}
-	    }
-	}
+proc read_revs {view} {
+    global viewstate
+
+    set viewstate($view) 0
+    nowbusy $view
+    do_layout start_rev_list $view
+    if {![info exists viewgen($curview)]} {
+	set viewgen($curview) 1
+    } else {
+	incr viewgen($curview)
     }
-    if {[info exists hlview] && $view == $hlview} {
-	vhighlightmore
+}
+
+proc viewdone {view err gen} {
+    global viewstate viewgen
+
+    if {$viewgen($view) != $gen} return
+    set viewstate($view) 1
+    notbusy $view
+    if {$err ne {}} {
+	error_popup $err
     }
-    return $more
 }
 
 proc readcommit {id} {
@@ -500,24 +1069,17 @@ proc readcommit {id} {
     parsecommit $id $contents 0
 }
 
-proc updatecommits {} {
-    global viewdata curview phase
-    global selectedline thickerline
+proc reloadcommits {} {
+    global selectedline thickerline curview
 
-    if {$phase ne {}} {
-	stop_rev_list
-	set phase {}
-    }
-    set n $curview
-    tsv::unset children$n
-    tsv::unset parents$n
-    set curview -1
     catch {unset selectedline}
     catch {unset thickerline}
-    catch {unset viewdata($n)}
+    catch {unset matchinglines}
+    catch {unset treediffs}
     discardallcommits
+    stopfindproc
     readrefs
-    showview $n
+    getcommits $curview
 }
 
 proc parsecommit {id contents listed} {
@@ -590,12 +1152,14 @@ proc getcommit {id} {
 }
 
 proc readrefs {} {
-    global tagids idtags headids idheads tagobjid
+    global tagids headids tagobjid
     global otherrefids idotherrefs mainhead mainheadid
 
-    foreach v {tagids idtags headids idheads otherrefids idotherrefs} {
+    foreach v {tagids headids otherrefids idotherrefs} {
 	catch {unset $v}
     }
+    catch {tsv::unset idtags}
+    catch {tsv::unset idheads}
     set refd [open [list | git ls-remote [gitdir]] r]
     while {[gets $refd line] >= 0} {
 	set e [split $line "\t"]
@@ -609,12 +1173,12 @@ proc readrefs {} {
 	if {[string match "remotes/*" $name]} {
 	    if {![string match "*/HEAD" $name]} {
 		set headids($name) $id
-		lappend idheads($id) $name
+		tsv::lpush idheads $id $name end
 	    }
 	} elseif {[string match "heads/*" $name]} {
 	    set name [string range $name 6 end]
 	    set headids($name) $id
-	    lappend idheads($id) $name
+	    tsv::lpush idheads $id $name end
 	} elseif {[string match "tags/*" $name]} {
 	    # this lets refs/tags/foo^{} overwrite refs/tags/foo,
 	    # which is what we want since the former is the commit ID
@@ -625,7 +1189,7 @@ proc readrefs {} {
 		set tagobjid($name) $id
 	    }
 	    set tagids($name) $id
-	    lappend idtags($id) $name
+	    tsv::lpush idtags $id $name end
 	} else {
 	    set otherrefids($name) $id
 	    lappend idotherrefs($id) $name
@@ -695,7 +1259,7 @@ proc makewindow {} {
     .bar add cascade -label "File" -menu .bar.file
     .bar configure -font $uifont
     menu .bar.file
-    .bar.file add command -label "Update" -command updatecommits
+    .bar.file add command -label "Reload" -command reloadcommits
     .bar.file add command -label "Reread references" -command rereadrefs
     .bar.file add command -label "Quit" -command doquit
     .bar.file configure -font $uifont
@@ -1079,8 +1643,8 @@ proc click {w} {
 proc savestuff {w} {
     global canv canv2 canv3 ctext cflist mainfont textfont uifont
     global stuffsaved findmergefiles maxgraphpct
-    global maxwidth showneartags showlocalchanges
-    global viewname viewfiles viewargs viewperm nextviewnum
+    global showneartags
+    global viewperm nextviewnum
     global cmitmode wrapcomment
     global colors bgcolor fgcolor diffcolors
 
@@ -1093,11 +1657,11 @@ proc savestuff {w} {
 	puts $f [list set uifont $uifont]
 	puts $f [list set findmergefiles $findmergefiles]
 	puts $f [list set maxgraphpct $maxgraphpct]
-	puts $f [list set maxwidth $maxwidth]
+	puts $f [list set maxwidth [tsv::get options maxwidth]]
 	puts $f [list set cmitmode $cmitmode]
 	puts $f [list set wrapcomment $wrapcomment]
 	puts $f [list set showneartags $showneartags]
-	puts $f [list set showlocalchanges $showlocalchanges]
+	puts $f [list set showlocalchanges [tsv::get options showlocalchanges]]
 	puts $f [list set bgcolor $bgcolor]
 	puts $f [list set fgcolor $fgcolor]
 	puts $f [list set colors $colors]
@@ -1117,7 +1681,8 @@ proc savestuff {w} {
 	puts -nonewline $f "set permviews {"
 	for {set v 0} {$v < $nextviewnum} {incr v} {
 	    if {$viewperm($v)} {
-		puts $f "{[list $viewname($v) $viewfiles($v) $viewargs($v)]}"
+		puts $f "{[list [tsv::get viewname $v] \
+			 [tsv::get viewfiles $v] [tsv::get viewargs $v]]}"
 	    }
 	}
 	puts $f "}"
@@ -1707,22 +2272,21 @@ proc newview {ishighlight} {
 
 proc editview {} {
     global curview
-    global viewname viewperm newviewname newviewperm
-    global viewargs newviewargs
+    global viewperm newviewname newviewperm newviewargs
 
     set top .gitkvedit-$curview
     if {[winfo exists $top]} {
 	raise $top
 	return
     }
-    set newviewname($curview) $viewname($curview)
+    set newviewname($curview) [tsv::get viewname $curview]
     set newviewperm($curview) $viewperm($curview)
-    set newviewargs($curview) [shellarglist $viewargs($curview)]
-    vieweditor $top $curview "Gitk: edit view $viewname($curview)"
+    set newviewargs($curview) [shellarglist [tsv::get viewargs $curview]]
+    vieweditor $top $curview "Gitk: edit view $newviewname($curview)"
 }
 
 proc vieweditor {top n title} {
-    global newviewname newviewperm viewfiles
+    global newviewperm
     global uifont
 
     toplevel $top
@@ -1742,8 +2306,8 @@ proc vieweditor {top n title} {
 	-text "Enter files and directories to include, one per line:"
     grid $top.l - -sticky w
     text $top.t -width 40 -height 10 -background white
-    if {[info exists viewfiles($n)]} {
-	foreach f $viewfiles($n) {
+    if {[tsv::exists viewfiles $n]} {
+	foreach f [tsv::get viewfiles $n] {
 	    $top.t insert end $f
 	    $top.t insert end "\n"
 	}
@@ -1780,8 +2344,8 @@ proc allviewmenus {n op args} {
 
 proc newviewok {top n} {
     global nextviewnum newviewperm newviewname newishighlight
-    global viewname viewfiles viewperm selectedview curview
-    global viewargs newviewargs viewhlmenu
+    global viewperm selectedview curview
+    global newviewargs viewhlmenu
 
     if {[catch {
 	set newargs [shellsplit $newviewargs($n)]
@@ -1798,13 +2362,13 @@ proc newviewok {top n} {
 	    lappend files $ft
 	}
     }
-    if {![info exists viewfiles($n)]} {
+    if {![tsv::exists viewfiles $n]} {
 	# creating a new view
 	incr nextviewnum
-	set viewname($n) $newviewname($n)
+	tsv::set viewname $n $newviewname($n)
 	set viewperm($n) $newviewperm($n)
-	set viewfiles($n) $files
-	set viewargs($n) $newargs
+	tsv::set viewfiles $n $files
+	tsv::set viewargs $n $newargs
 	addviewmenu $n
 	if {!$newishighlight} {
 	    run showview $n
@@ -1814,18 +2378,20 @@ proc newviewok {top n} {
     } else {
 	# editing an existing view
 	set viewperm($n) $newviewperm($n)
-	if {$newviewname($n) ne $viewname($n)} {
-	    set viewname($n) $newviewname($n)
+	if {$newviewname($n) ne [tsv::get viewname $n]} {
+	    tsv::set viewname $n $newviewname($n)
 	    doviewmenu .bar.view 7 [list showview $n] \
-		entryconf [list -label $viewname($n)]
+		entryconf [list -label $newviewname($n)]
 	    doviewmenu $viewhlmenu 1 [list addvhighlight $n] \
-		entryconf [list -label $viewname($n) -value $viewname($n)]
+		entryconf [list -label $newviewname($n) \
+			       -value $newviewname($n)]
 	}
-	if {$files ne $viewfiles($n) || $newargs ne $viewargs($n)} {
-	    set viewfiles($n) $files
-	    set viewargs($n) $newargs
+	if {$files ne [tsv::get viewfiles $n] ||
+	    $newargs ne [tsv::get viewargs $n]} {
+	    tsv::set viewfiles $n $files
+	    tsv::set viewargs $n $newargs
 	    if {$curview == $n} {
-		run updatecommits
+		run reloadcommits
 	    }
 	}
     }
@@ -1833,7 +2399,7 @@ proc newviewok {top n} {
 }
 
 proc delview {} {
-    global curview viewdata viewperm hlview selectedhlview
+    global curview viewperm hlview selectedhlview
 
     if {$curview == 0} return
     if {[info exists hlview] && $hlview == $curview} {
@@ -1841,30 +2407,26 @@ proc delview {} {
 	unset hlview
     }
     allviewmenus $curview delete
-    set viewdata($curview) {}
     set viewperm($curview) 0
     showview 0
 }
 
 proc addviewmenu {n} {
-    global viewname viewhlmenu
+    global viewhlmenu
 
-    .bar.view add radiobutton -label $viewname($n) \
+    .bar.view add radiobutton -label [tsv::get viewname $n] \
 	-command [list showview $n] -variable selectedview -value $n
-    $viewhlmenu add radiobutton -label $viewname($n) \
+    $viewhlmenu add radiobutton -label [tsv::get viewname $n] \
 	-command [list addvhighlight $n] -variable selectedhlview
 }
 
 proc showview {n} {
-    global curview viewdata viewfiles
-    global rowoffsets
+    global curview viewstate
     global colormap rowtextx nextcolor canvxmax
-    global numcommits rowchk
+    global numcommits vncommits vphase
     global selectedline currentid canv canvy0
-    global matchinglines treediffs idinlist
-    global pending_select phase misordered
-    global commitidx rowlaidout rowoptim
-    global commfd
+    global matchinglines treediffs
+    global pending_select phase
     global selectedview nullid selectfirst
     global hlview selectedhlview
 
@@ -1890,17 +2452,10 @@ proc showview {n} {
     unselectline
     normalline
     stopfindproc
-    if {$curview >= 0} {
-	if {$phase ne {}} {
-	    set viewdata($curview) \
-		[list $phase $rowidlist $rowoffsets \
-		     [array get idinlist] \
-		     $rowlaidout $rowoptim $numcommits]
-	} elseif {![info exists viewdata($curview)]
-		  || [lindex $viewdata($curview) 0] ne {}} {
-	    set viewdata($curview) [list {}]
-	}
-    }
+
+    set vncommits($curview) $numcommits
+    set vphase($curview) $phase
+
     catch {unset matchinglines}
     catch {unset treediffs}
     clear_display
@@ -1909,47 +2464,57 @@ proc showview {n} {
 	set selectedhlview None
     }
 
-    set curview $n
     set selectedview $n
     .bar.view entryconf 2 -state [expr {$n == 0? "disabled": "normal"}]
     .bar.view entryconf 3 -state [expr {$n == 0? "disabled": "normal"}]
 
-    if {![info exists viewdata($n)]} {
-	if {$selid ne {}} {
-	    set pending_select $selid
-	}
-	getcommits
+    if {$selid ne {}} {
+	set pending_select $selid
+    }
+
+    if {![info exists viewstate($n)]} {
+	getcommits $n
 	return
     }
 
-    set v $viewdata($n)
-    set phase [lindex $v 0]
-    if {$phase eq {}} {
-	set numcommits [tsv::llength vdisporder $curview]
-    } else {
-	set rowidlist [lindex $v 1]
-	set rowoffsets [lindex $v 2]
-	array set idinlist [lindex $v 3]
-	set rowlaidout [lindex $v 4]
-	set rowoptim [lindex $v 5]
-	set numcommits [lindex $v 6]
-	catch {unset rowchk}
+    do_layout switch_view $n
+    set curview $n
+
+    if {![info exists vphase($n)]} {
+	nowbusy layout
+	set phase getcommits
+	init_screen
+	show_status "Reading commits..."
+	return
     }
+
+    set phase $vphase($n)
+    set numcommits $vncommits($n)
 
     catch {unset colormap}
     catch {unset rowtextx}
     set nextcolor 0
     set canvxmax [$canv cget -width]
-    set curview $n
-    set row 0
     setcanvscroll
+
+    if {$numcommits == 0} {
+	if {$phase ne {}} {
+	    if {$phase eq "getcommits"} {
+		show_status "Reading commits..."
+	    }
+	} else {
+	    show_status "No commits selected"
+	}
+	return
+    }
+
     set yf 0
     set row {}
     set selectfirst 0
     if {$selid ne {}} {
 	set row [rowofcommit $n $selid]
 	# try to get the selected row in the same position on the screen
-	if {$row ne {}} {
+	if {$row ne {} && $row < $numcommits} {
 	    set ymax [lindex [$canv cget -scrollregion] 3]
 	    set ytop [expr {[yc $row] - $yscreen}]
 	    if {$ytop < 0} {
@@ -1960,25 +2525,15 @@ proc showview {n} {
     }
     allcanvs yview moveto $yf
     drawvisible
-    if {$row ne {}} {
+    if {$row ne {} && $row < $numcommits} {
 	selectline $row 0
-    } elseif {$selid ne {}} {
-	set pending_select $selid
-    } else {
-	set row [expr {[tsv::lindex vdisporder $curview 0] eq $nullid}]
+    } elseif {$selid eq {}} {
+	set row [expr {[tsv::lindex disporder $curview 0] eq $nullid}]
 	if {$row < $numcommits} {
 	    selectline $row 0
 	} else {
 	    set selectfirst 1
 	}
-    }
-    if {$phase ne {}} {
-	if {$phase eq "getcommits"} {
-	    show_status "Reading commits..."
-	}
-	run chewcommits $n
-    } elseif {$numcommits == 0} {
-	show_status "No commits selected"
     }
 }
 
@@ -2045,19 +2600,22 @@ proc unbolden {} {
 }
 
 proc addvhighlight {n} {
-    global hlview curview viewdata vhl_done vhighlights commitidx
+    global hlview curview vhl_done viewstate
 
     if {[info exists hlview]} {
 	delvhighlight
     }
     set hlview $n
-    if {$n != $curview && ![info exists viewdata($n)]} {
-	set viewdata($n) [list getcommits {{}} {{}} {} {} {} 0 0 0 {}]
-	start_rev_list $n
+    if {![info exists viewstate($n)]} {
+	read_revs $view
     }
-    set vhl_done $commitidx($hlview)
-    if {$vhl_done > 0} {
-	drawvisible
+    if {[tsv::exists disporder $n]} {
+	set vhl_done [tsv::llength disporder $n]
+	if {$vhl_done > 0} {
+	    drawvisible
+	}
+    } else {
+	set vhl_done 0
     }
 }
 
@@ -2070,17 +2628,16 @@ proc delvhighlight {} {
     unbolden
 }
 
-proc vhighlightmore {} {
-    global hlview vhl_done commitidx vhighlights
+proc vhighlightmore {max} {
+    global hlview vhl_done vhighlights
     global curview mainfont
 
     set font [concat $mainfont bold]
-    set max $commitidx($hlview)
     set vr [visiblerows]
     set r0 [lindex $vr 0]
     set r1 [lindex $vr 1]
     for {set i $vhl_done} {$i < $max} {incr i} {
-	set id [tsv::lindex $vdisporder $hlview $i]
+	set id [tsv::lindex disporder $hlview $i]
 	set row [rowofcommit $curview $id]
 	if {$row ne {}} {
 	    if {$r0 <= $row && $row <= $r1} {
@@ -2318,7 +2875,7 @@ proc is_descendent {a} {
     set done 0
     for {set i 0} {$i < [llength $todo]} {incr i} {
 	set do [lindex $todo $i]
-	if {[tokencmp $toka [tsv::get ctok$v $do]] < 0} {
+	if {[tokencmp [tsv::get ctok$v $do] $toka] < 0} {
 	    lappend leftover $do
 	    continue
 	}
@@ -2351,7 +2908,7 @@ proc is_ancestor {a} {
     for {set i 0} {$i < [llength $todo]} {incr i} {
 	set do [lindex $todo $i]
 	if {![tsv::exists ctok$v $do] ||
-	    [tokencmp $toka [tsv::get ctok$v $do]] > 0} {
+	    [tokencmp [tsv::get ctok$v $do] $toka] > 0} {
 	    lappend leftover $do
 	    continue
 	}
@@ -2405,7 +2962,7 @@ proc askrelhighlight {row id} {
 }
 
 proc next_hlcont {} {
-    global fhl_row fhl_dirn numcommits
+    global fhl_row fhl_dirn numcommits curview
     global vhighlights fhighlights nhighlights rhighlights
     global hlview filehighlight findstring highlight_related
 
@@ -2417,7 +2974,7 @@ proc next_hlcont {} {
 	    set fhl_dirn 0
 	    return
 	}
-	set id [tsv::lindex vdisporder $curview $row]
+	set id [tsv::lindex disporder $curview $row]
 	if {[info exists hlview]} {
 	    if {![info exists vhighlights($row)]} {
 		askvhighlight $row $id
@@ -2442,7 +2999,7 @@ proc next_hlcont {} {
 		set r $row
 		for {set n 0} {$n < 100} {incr n} {
 		    if {![info exists fhighlights($r)]} {
-			askfilehighlight $r [tsv::lindex vdisporder $curview $r]
+			askfilehighlight $r [tsv::lindex disporder $curview $r]
 		    }
 		    incr r $fhl_dirn
 		    if {$r < 0 || $r >= $numcommits} break
@@ -2479,115 +3036,18 @@ proc cancel_next_highlight {} {
     set fhl_dirn 0
 }
 
-# Graph layout functions
+# Graph display functions
 
-proc shortids {ids} {
-    set res {}
-    foreach id $ids {
-	if {[llength $id] > 1} {
-	    lappend res [shortids $id]
-	} elseif {[regexp {^[0-9a-f]{40}$} $id]} {
-	    lappend res [string range $id 0 7]
-	} else {
-	    lappend res $id
-	}
-    }
-    return $res
-}
-
-proc incrange {l x o} {
-    set n [llength $l]
-    while {$x < $n} {
-	set e [lindex $l $x]
-	if {$e ne {}} {
-	    lset l $x [expr {$e + $o}]
-	}
-	incr x
-    }
-    return $l
-}
-
-proc ntimes {n o} {
-    set ret {}
-    for {} {$n > 0} {incr n -1} {
-	lappend ret $o
-    }
-    return $ret
-}
-
-proc usedinrange {id l1 l2} {
-    global curview
-
-    set id1 [tsv::lindex vdisporder $curview $l1]
-    set tok1 [tsv::get ctok$curview $id1]
-    set id2 [tsv::lindex vdisporder $curview $l2]
-    set tok2 [tsv::get ctok$curview $id2]
-    if {[tsv::exists ctok$curview $id]} {
-	set t [tsv::get ctok$curview $id]
-	if {[tokencmp $tok1 $t] <= 0 && [tokencmp $t $tok2] <= 0} {
-	    set r [rowofcommit $curview $id]
-	    return [expr {$r - $l1 + 1}]
-	}
-    }
-    set kids [tsv::get children$curview $id]
-    foreach c $kids {
-	if {[tsv::exists ctok$curview $c]} {
-	    set t [tsv::get ctok$curview $c]
-	    if {[tokencmp $tok1 $t] <= 0 && [tokencmp $t $tok2] <= 0} {
-		set r [rowofcommit $curview $c]
-		return [expr {$r - $l1 + 1}]
-	    }
-	}
-    }
-    return 0
-}
-
-proc makeuparrow {oid x y z} {
-    global rowidlist rowoffsets uparrowlen idrowranges curview
-
-    for {set i 1} {$i < $uparrowlen && $y > 1} {incr i} {
-	incr y -1
-	incr x $z
-	set off0 [lindex $rowoffsets $y]
-	for {set x0 $x} {1} {incr x0} {
-	    if {$x0 >= [llength $off0]} {
-		set x0 [llength [lindex $rowoffsets [expr {$y-1}]]]
-		break
-	    }
-	    set z [lindex $off0 $x0]
-	    if {$z ne {}} {
-		incr x0 $z
-		break
-	    }
-	}
-	set z [expr {$x0 - $x}]
-	lset rowidlist $y [linsert [lindex $rowidlist $y] $x $oid]
-	lset rowoffsets $y [linsert [lindex $rowoffsets $y] $x $z]
-    }
-    set tmp [lreplace [lindex $rowoffsets $y] $x $x {}]
-    lset rowoffsets $y [incrange $tmp [expr {$x+1}] -1]
-    lappend idrowranges($curview,$oid) [tsv::lindex vdisporder $curview $y]
-}
-
-proc initlayout {} {
-    global rowidlist rowoffsets rowlaidout rowoptim
-    global idinlist rowchk idrowranges
+proc init_screen {} {
     global numcommits canvxmax canv
     global nextcolor colormap rowtextx
-    global selectfirst curview
+    global selectfirst
 
     set numcommits 0
     set nextcolor 0
-    set rowidlist {{}}
-    set rowoffsets {{}}
-    catch {unset idinlist}
-    catch {unset rowchk}
-    set rowlaidout 0
-    set rowoptim 0
     set canvxmax [$canv cget -width]
     catch {unset colormap}
     catch {unset rowtextx}
-    array unset idrowranges $curview,*
     set selectfirst 1
 }
 
@@ -2598,6 +3058,26 @@ proc setcanvscroll {} {
     $canv conf -scrollregion [list 0 0 $canvxmax $ymax]
     $canv2 conf -scrollregion [list 0 0 0 $ymax]
     $canv3 conf -scrollregion [list 0 0 0 $ymax]
+}
+
+proc newcommits {view nrows gen} {
+    global hlview viewgen
+
+    if {[info exists hlview] && $view == $hlview && $viewgen($view) == $gen} {
+	vhighlightmore $nrows
+    }
+}
+
+proc truncatecommits {view nrows gen} {
+    global curview hlview vhl_done viewgen
+
+    if {$viewgen($view) != $gen} return
+    if {$view == $curview} {
+	trim_display $nrows
+    }
+    if {[info exists hlview] && $view == $hlview && $nrows <= $vhl_done} {
+	set vhl_done [expr {$nrows - 1}]
+    }
 }
 
 proc trim_display {nlines} {
@@ -2631,79 +3111,30 @@ proc visiblerows {} {
     return [list $r0 $r1]
 }
 
-proc layoutmore {tmax allread} {
-    global rowlaidout rowoptim commitidx numcommits optim_delay
-    global uparrowlen curview rowidlist idinlist
-
-    set showlast 0
-    set showdelay $optim_delay
-    set optdelay [expr {$uparrowlen + 1}]
-    while {1} {
-	if {$rowoptim - $showdelay > $numcommits} {
-	    showstuff [expr {$rowoptim - $showdelay}] $showlast
-	} elseif {$rowlaidout - $optdelay > $rowoptim} {
-	    set nr [expr {$rowlaidout - $optdelay - $rowoptim}]
-	    if {$nr > 100} {
-		set nr 100
-	    }
-	    optimize_rows $rowoptim 0 [expr {$rowoptim + $nr}]
-	    incr rowoptim $nr
-	} elseif {$commitidx($curview) > $rowlaidout} {
-	    set nr [expr {$commitidx($curview) - $rowlaidout}]
-	    # may need to increase this threshold if uparrowlen or
-	    # mingaplen are increased...
-	    if {$nr > 150} {
-		set nr 150
-	    }
-	    set row $rowlaidout
-	    set rowlaidout [layoutrows $row [expr {$row + $nr}] $allread]
-	    if {$rowlaidout == $row} {
-		return 0
-	    }
-	} elseif {$allread} {
-	    set optdelay 0
-	    set nrows $commitidx($curview)
-	    if {[lindex $rowidlist $nrows] ne {} ||
-		[array names idinlist] ne {}} {
-		layouttail
-		set rowlaidout $commitidx($curview)
-	    } elseif {$rowoptim == $nrows} {
-		set showdelay 0
-		set showlast 1
-		if {$numcommits == $nrows} {
-		    return 0
-		}
-	    }
-	} else {
-	    return 0
-	}
-	if {$tmax ne {} && [clock clicks -milliseconds] >= $tmax} {
-	    return 1
-	}
-    }
-}
-
 # see if `id' is shown on a row before `row'
 proc comesbefore {id row} {
     global curview
 
     return [expr {[tsv::exists ctok$curview $id] &&
 		  [tokencmp [tsv::get ctok$curview $id] \
-		   [tsv::lindex vdisporder $curview [expr {$row - 1}]]] <= 0}]
+		   [tsv::lindex disporder $curview [expr {$row - 1}]]] <= 0}]
 }
 
-proc showstuff {canshow last} {
+proc showstuff {view canshow last gen} {
     global numcommits pending_select selectedline curview
     global lookingforhead mainheadid nullid selectfirst
-    global lastscrollset rowidlist
+    global lastscrollset viewgen
 
+    if {$viewgen($view) != $gen} return
+    if {$view != $curview} {
+	global vncommits
+	set vncommits($view) $canshow
+	return
+    }
     if {$numcommits == 0} {
 	global phase
 	set phase "incrdraw"
 	allcanvs delete all
-    }
-    for {set r $numcommits} {$r < $canshow} {incr r} {
-	tsv::lpush rowidlist $curview [lindex $rowidlist $r] end
     }
     set r0 $numcommits
     set prev $numcommits
@@ -2729,7 +3160,7 @@ proc showstuff {canshow last} {
 	if {[info exists selectedline] || [info exists pending_select]} {
 	    set selectfirst 0
 	} else {
-	    set l [expr {[tsv::lindex vdisporder $curview 0] eq $nullid}]
+	    set l [expr {[tsv::lindex disporder $curview 0] eq $nullid}]
 	    selectline $l 1
 	    set selectfirst 0
 	}
@@ -2740,10 +3171,34 @@ proc showstuff {canshow last} {
 	set lookingforhead 0
 	dodiffindex
     }
+    if {$last} {
+	if {[info exists pending_select]} {
+	    set row [expr {[tsv::lindex disporder $curview 0] eq $nullid}]
+	    selectline $row 1
+	}
+	if {$numcommits == 0} {
+	    show_status "No commits selected"
+	}
+	notbusy layout
+	set phase {}
+    }
+}
+
+proc showmisordered {view gen} {
+    global curview viewgen
+
+    if {$view != $curview || $gen != $viewgen($curview)} return
+    if {[info exists selectedline]} {
+	set pending_select $currentid
+	unset selectedline
+    }
+    # note show_status does clear_display
+    show_status "Redoing layout due to misordered commits"
+    init_screen
 }
 
 proc doshowlocalchanges {} {
-    global lookingforhead curview mainheadid phase
+    global lookingforhead curview mainheadid phase numcommits
 
     if {[tsv::exists ctok$curview $mainheadid] &&
 	($phase eq {} || [comesbefore $mainheadid [expr {$numcommits - 1}]])} {
@@ -2800,297 +3255,6 @@ proc readdiffindex {fd serial} {
     return 0
 }
 
-proc layoutrows {row endrow last} {
-    global rowidlist rowoffsets
-    global uparrowlen downarrowlen maxwidth mingaplen
-    global commitidx curview
-    global idinlist rowchk idrowranges
-
-    set idlist [lindex $rowidlist $row]
-    set offs [lindex $rowoffsets $row]
-    while {$row < $endrow} {
-	set id [tsv::lindex vdisporder $curview $row]
-	set oldolds {}
-	set newolds {}
-	foreach p [tsv::get parents$curview $id] {
-	    if {![info exists idinlist($p)]} {
-		lappend newolds $p
-	    } elseif {!$idinlist($p)} {
-		lappend oldolds $p
-	    }
-	}
-	set nev [expr {[llength $idlist] + [llength $newolds]
-		       + [llength $oldolds] - $maxwidth + 1}]
-	if {$nev > 0} {
-	    if {!$last &&
-		$row + $uparrowlen + $mingaplen >= $commitidx($curview)} break
-	    for {set x [llength $idlist]} {[incr x -1] >= 0} {} {
-		set i [lindex $idlist $x]
-		if {![info exists rowchk($i)] || $row >= $rowchk($i)} {
-		    set r [usedinrange $i [expr {$row - $downarrowlen}] \
-			       [expr {$row + $uparrowlen + $mingaplen}]]
-		    if {$r == 0} {
-			set idlist [lreplace $idlist $x $x]
-			set offs [lreplace $offs $x $x]
-			set offs [incrange $offs $x 1]
-			set idinlist($i) 0
-			set rm1 [expr {$row - 1}]
-			lappend idrowranges($curview,$i) \
-			    [tsv::lindex vdisporder $curview $rm1]
-			if {[incr nev -1] <= 0} break
-			continue
-		    }
-		    set rowchk($id) [expr {$row + $r}]
-		}
-	    }
-	    lset rowidlist $row $idlist
-	    lset rowoffsets $row $offs
-	}
-	set col [lsearch -exact $idlist $id]
-	if {$col < 0} {
-	    set col [llength $idlist]
-	    lappend idlist $id
-	    lset rowidlist $row $idlist
-	    set z {}
-	    if {[tsv::get children$curview $id] ne {}} {
-		set z [expr {[llength [lindex $rowidlist [expr {$row-1}]]] - $col}]
-		unset idinlist($id)
-	    }
-	    lappend offs $z
-	    lset rowoffsets $row $offs
-	    if {$z ne {}} {
-		makeuparrow $id $col $row $z
-	    }
-	} else {
-	    unset idinlist($id)
-	}
-	set ranges {}
-	if {[info exists idrowranges($curview,$id)]} {
-	    lappend $idrowranges($curview,$id) $id
-	}
-	incr row
-	set offs [ntimes [llength $idlist] 0]
-	set l [llength $newolds]
-	set idlist [eval lreplace \$idlist $col $col $newolds]
-	set o 0
-	if {$l != 1} {
-	    set offs [lrange $offs 0 [expr {$col - 1}]]
-	    foreach x $newolds {
-		lappend offs {}
-		incr o -1
-	    }
-	    incr o
-	    set tmp [expr {[llength $idlist] - [llength $offs]}]
-	    if {$tmp > 0} {
-		set offs [concat $offs [ntimes $tmp $o]]
-	    }
-	} else {
-	    lset offs $col {}
-	}
-	foreach i $newolds {
-	    set idinlist($i) 1
-	    set idrowranges($curview,$i) $id
-	}
-	incr col $l
-	foreach oid $oldolds {
-	    set idinlist($oid) 1
-	    set idlist [linsert $idlist $col $oid]
-	    set offs [linsert $offs $col $o]
-	    makeuparrow $oid $col $row $o
-	    incr col
-	}
-	lappend rowidlist $idlist
-	lappend rowoffsets $offs
-    }
-    return $row
-}
-
-proc addextraid {id row} {
-    global vnexttoken
-    global commitidx
-    global curview
-
-    incr commitidx($curview)
-    tsv::lpush vdisporder $curview $id end
-    tsv::lpush vcmitlisted $curview 0 end
-    tsv::set parents$curview $id {}
-    tsv::set ctok$curview $id) $vnexttoken($curview)
-    incr vnexttoken($curview)
-    readcommit $id
-    if {![tsv::exists commitinfo $id]} {
-	tsv::set commitinfo $id {"No commit information available"}
-    }
-    if {![tsv::exists children$curview $id]} {
-	tsv::set children$curview $id {}
-    }
-}
-
-proc layouttail {} {
-    global rowidlist rowoffsets idinlist commitidx curview
-    global idrowranges
-
-    set row $commitidx($curview)
-    set idlist [lindex $rowidlist $row]
-    while {$idlist ne {}} {
-	set col [expr {[llength $idlist] - 1}]
-	set id [lindex $idlist $col]
-	addextraid $id $row
-	unset idinlist($id)
-	lappend idrowranges($curview,$id) $row
-	incr row
-	set offs [ntimes $col 0]
-	set idlist [lreplace $idlist $col $col]
-	lappend rowidlist $idlist
-	lappend rowoffsets $offs
-    }
-
-    foreach id [array names idinlist] {
-	unset idinlist($id)
-	addextraid $id $row
-	lset rowidlist $row [list $id]
-	lset rowoffsets $row 0
-	makeuparrow $id 0 $row 0
-	lappend idrowranges($curview,$id) $row
-	incr row
-	lappend rowidlist {}
-	lappend rowoffsets {}
-    }
-}
-
-proc insert_pad {row col npad} {
-    global rowidlist rowoffsets curview
-
-    set pad [ntimes $npad {}]
-    lset rowidlist $row [eval linsert [list [lindex $rowidlist $row]] $col $pad]
-    set tmp [eval linsert [list [lindex $rowoffsets $row]] $col $pad]
-    lset rowoffsets $row [incrange $tmp [expr {$col + $npad}] [expr {-$npad}]]
-}
-
-proc optimize_rows {row col endrow} {
-    global rowidlist rowoffsets curview
-
-    for {} {$row < $endrow} {incr row} {
-	set idlist [lindex $rowidlist $row]
-	set offs [lindex $rowoffsets $row]
-	set haspad 0
-	for {} {$col < [llength $offs]} {incr col} {
-	    set id [lindex $idlist $col]
-	    if {$id eq {}} {
-		set haspad 1
-		continue
-	    }
-	    set z [lindex $offs $col]
-	    if {$z eq {}} continue
-	    set isarrow 0
-	    set x0 [expr {$col + $z}]
-	    set y0 [expr {$row - 1}]
-	    set z0 [lindex $rowoffsets $y0 $x0]
-	    if {$z0 eq {}} {
-		set kid [tsv::lindex vdisporder $curview [expr {$row - 2}]]
-		if {[tsv::lsearch children$curview $id -exact $kid] < 0} {
-		    set isarrow 1
-		}
-	    }
-	    # Looking at lines from this row to the previous row,
-	    # make them go straight up if they end in an arrow on
-	    # the previous row; otherwise make them go straight up
-	    # or at 45 degrees.
-	    if {$z < -1 || ($z < 0 && $isarrow)} {
-		# Line currently goes left too much;
-		# insert pads in the previous row, then optimize it
-		set npad [expr {-1 - $z + $isarrow}]
-		set offs [incrange $offs $col $npad]
-		insert_pad $y0 $x0 $npad
-		if {$y0 > 0} {
-		    optimize_rows $y0 $x0 $row
-		}
-		set z [lindex $offs $col]
-		set x0 [expr {$col + $z}]
-		set z0 [lindex $rowoffsets $y0 $x0]
-	    } elseif {$z > 1 || ($z > 0 && $isarrow)} {
-		# Line currently goes right too much;
-		# insert pads in this line and adjust the next's rowoffsets
-		set npad [expr {$z - 1 + $isarrow}]
-		set y1 [expr {$row + 1}]
-		set offs2 [lindex $rowoffsets $y1]
-		set x1 -1
-		foreach z $offs2 {
-		    incr x1
-		    if {$z eq {} || $x1 + $z < $col} continue
-		    if {$x1 + $z > $col} {
-			incr npad
-		    }
-		    lset rowoffsets $y1 [incrange $offs2 $x1 $npad]
-		    break
-		}
-		set pad [ntimes $npad {}]
-		set idlist [eval linsert \$idlist $col $pad]
-		set tmp [eval linsert \$offs $col $pad]
-		incr col $npad
-		set offs [incrange $tmp $col [expr {-$npad}]]
-		set z [lindex $offs $col]
-		set haspad 1
-	    }
-	    if {$z0 eq {} && !$isarrow} {
-		# this line links to its first child on row $row-2
-		set rm2 [expr {$row - 2}]
-		set id [tsv::lindex vdisporder $curview $rm2]
-		set xc [lsearch -exact [lindex $rowidlist $rm2] $id]
-		if {$xc >= 0} {
-		    set z0 [expr {$xc - $x0}]
-		}
-	    }
-	    # avoid lines jigging left then immediately right
-	    if {$z0 ne {} && $z < 0 && $z0 > 0} {
-		insert_pad $y0 $x0 1
-		set offs [incrange $offs $col 1]
-		optimize_rows $y0 [expr {$x0 + 1}] $row
-	    }
-	}
-	if {!$haspad} {
-	    set o {}
-	    # Find the first column that doesn't have a line going right
-	    for {set col [llength $idlist]} {[incr col -1] >= 0} {} {
-		set o [lindex $offs $col]
-		if {$o eq {}} {
-		    # check if this is the link to the first child
-		    set id [lindex $idlist $col]
-		    set y0 [expr {$row - 1}]
-		    set kid [tsv::lindex vdisporder $curview $y0]
-		    if {[tsv::lsearch children$curview $id -exact $kid] >= 0} {
-			# it is, work out offset to child
-			set x0 [lsearch -exact [lindex $rowidlist $y0] $kid]
-			if {$x0 >= 0} {
-			    set o [expr {$x0 - $col}]
-			}
-		    }
-		}
-		if {$o eq {} || $o <= 0} break
-	    }
-	    # Insert a pad at that column as long as it has a line and
-	    # isn't the last column, and adjust the next row' offsets
-	    if {$o ne {} && [incr col] < [llength $idlist]} {
-		set y1 [expr {$row + 1}]
-		set offs2 [lindex $rowoffsets $y1]
-		set x1 -1
-		foreach z $offs2 {
-		    incr x1
-		    if {$z eq {} || $x1 + $z < $col} continue
-		    lset rowoffsets $y1 [incrange $offs2 $x1 1]
-		    break
-		}
-		set idlist [linsert $idlist $col {}]
-		set tmp [linsert $offs $col {}]
-		incr col
-		set offs [incrange $tmp $col -1]
-	    }
-	}
-	lset rowidlist $row $idlist
-	lset rowoffsets $row $offs
-	set col 0
-    }
-}
-
 proc xc {row col} {
     global canvx0 linespc
     return [expr {$canvx0 + $col * $linespc}]
@@ -3109,23 +3273,6 @@ proc linewidth {id} {
 	set wid [expr {2 * $lthickness}]
     }
     return $wid
-}
-
-proc rowranges {id} {
-    global phase idrowranges rowlaidout curview
-
-    set ranges {}
-    if {[info exists idrowranges($curview,$id)]} {
-	set ranges $idrowranges($curview,$id)
-    }
-    set linenos {}
-    foreach rid $ranges {
-	lappend linenos [rowofcommit $curview $rid]
-    }
-    if {$linenos ne {}} {
-	lset linenos 0 [expr {[lindex $linenos 0] + 1}]
-    }
-    return $linenos
 }
 
 # work around tk8.4 refusal to draw arrows on diagonal segments
@@ -3150,27 +3297,107 @@ proc adjarrowhigh {coords} {
     return $coords
 }
 
+set mthreadstuff {
+    proc idcolumn {row id} {
+	global curview
+
+	return [lsearch -exact [tsv::lindex vrowidlist $curview $row] $id]
+    }
+
+    proc getrowids {row} {
+	global curview
+
+	return [tsv::lindex vrowidlist $curview $row]
+    }
+
+    proc adjust_layout {row inc idlist} {
+	global curview
+
+	if {$inc > 0} {
+	    tsv::lpush vrowidlist $curview $idlist $row
+	} else {
+	    tsv::lpop vrowidlist $curview $row
+	}
+    }
+}
+
+set mnotthreadstuff {
+    proc idcolumn {row id} {
+	global rowidlist
+
+	return [lsearch -exact [lindex $rowidlist $row] $id]
+    }
+
+    proc getrowids {row} {
+	global rowidlist
+
+	return [lindex $rowidlist $row]
+    }
+
+    proc adjust_layout {row inc idlist} {
+	global rowlaidout rowoptim lnumcommits curview commitidx
+	global rowidlist rowoffsets
+
+	incr rowlaidout $inc
+	incr rowoptim $inc
+	incr lnumcommits $inc
+	incr commitidx($curview) $inc
+	if {$inc > 0} {
+	    set rowidlist [linsert $rowidlist $row $idlist]
+	} else {
+	    set rowidlist [lreplace $rowidlist $row $row]
+	}
+	if {$lnumcommits < $commitidx($curview)} {
+	    if {$inc > 0} {
+		set rowoffsets [linsert $rowoffsets $row {}]
+	    } else {
+		set rowoffsets [lreplace $rowoffsets $row $row]
+	    }
+	}
+    }
+}
+
+set mstuff {
+    proc rowranges {id} {
+	global curview
+	%ifnotthread% global idrowranges$curview
+
+	set ranges {}
+	if {[%tsvexists% idrowranges$curview $id]} {
+	    set ranges [%tsvget% idrowranges$curview $id]
+	}
+	set linenos {}
+	foreach rid $ranges {
+	    lappend linenos [rowofcommit $curview $rid]
+	}
+	if {$linenos ne {}} {
+	    lset linenos 0 [expr {[lindex $linenos 0] + 1}]
+	}
+	return $linenos
+    }
+}
+
 proc drawlineseg {id row endrow arrowlow} {
     global iddrawn linesegs
     global canv colormap linespc curview maxlinelen
 
-    set cols [list [lsearch -exact [tsv::lindex rowidlist $curview $row] $id]]
+    set cols [list [idcolumn $row $id]]
     set le [expr {$row + 1}]
     set arrowhigh 1
     while {1} {
-	set c [lsearch -exact [tsv::lindex rowidlist $curview $le] $id]
+	set c [idcolumn $le $id]
 	if {$c < 0} {
 	    incr le -1
 	    break
 	}
 	lappend cols $c
-	set x [tsv::lindex vdisporder $curview $le]
+	set x [tsv::lindex disporder $curview $le]
 	if {$x eq $id} {
 	    set arrowhigh 0
 	    break
 	}
 	if {[info exists iddrawn($x)] || $le == $endrow} {
-	    set c [lsearch -exact [tsv::lindex rowidlist $curview [expr {$le+1}]] $id]
+	    set c [idcolumn [expr {$le+1}] $id]
 	    if {$c >= 0} {
 		lappend cols $c
 		set arrowhigh 0
@@ -3227,8 +3454,7 @@ proc drawlineseg {id row endrow arrowlow} {
 	set itl [lindex $lines [expr {$i-1}] 2]
 	set al [$canv itemcget $itl -arrow]
 	set arrowlow [expr {$al eq "last" || $al eq "both"}]
-    } elseif {$arrowlow &&
-	      [lsearch -exact [tsv::lindex rowidlist $curview [expr {$row-1}]] $id] >= 0} {
+    } elseif {$arrowlow && [idcolumn [expr {$row-1}] $id] >= 0} {
 	set arrowlow 0
     }
     set arrow [lindex {none first last both} [expr {$arrowhigh + 2*$arrowlow}]]
@@ -3244,8 +3470,8 @@ proc drawlineseg {id row endrow arrowlow} {
     if {!$joinlow} {
 	if {$xp < 0} {
 	    # join parent line to first child
-	    set ch [tsv::lindex vdisporder $curview $row]
-	    set xc [lsearch -exact [tsv::lindex rowidlist $curview $row] $ch]
+	    set ch [tsv::lindex disporder $curview $row]
+	    set xc [idcolumn $row $ch]
 	    if {$xc < 0} {
 		puts "oops: drawlineseg: child $ch not on row $row"
 	    } else {
@@ -3291,7 +3517,7 @@ proc drawlineseg {id row endrow arrowlow} {
 	    lset lines $i 0 $row
 	}
     } else {
-	set xo [lsearch -exact [tsv::lindex rowidlist $curview [expr {$row - 1}]] $id]
+	set xo [idcolumn [expr {$row - 1}] $id]
 	set ndir [expr {$xo - $xp}]
 	set clow [$canv coords $itl]
 	if {$dir == $ndir} {
@@ -3324,7 +3550,7 @@ proc drawparentlinks {id row} {
     global canv colormap curview
     global idpos
 
-    set rowids [tsv::lindex rowidlist $curview $row]
+    set rowids [getrowids $row]
     set col [lsearch -exact $rowids $id]
     if {$col < 0} return
     set olds [tsv::get parents$curview $id]
@@ -3332,7 +3558,7 @@ proc drawparentlinks {id row} {
     set x [xc $row $col]
     set y [yc $row]
     set y2 [yc $row2]
-    set ids [tsv::lindex rowidlist $curview $row2]
+    set ids [getrowids $row2]
     # rmx = right-most X coord used
     set rmx 0
     foreach p $olds {
@@ -3378,7 +3604,7 @@ proc drawlines {id} {
 proc drawcmittext {id row col} {
     global linespc canv canv2 canv3 canvy0 fgcolor
     global curview
-    global rowtextx idpos idtags idheads idotherrefs
+    global rowtextx idpos idotherrefs
     global linehtag linentag linedtag
     global mainfont canvxmax boldrows boldnamerows fgcolor nullid
 
@@ -3396,10 +3622,10 @@ proc drawcmittext {id row col} {
 	       -fill $ofill -outline $fgcolor -width 1 -tags circle]
     $canv raise $t
     $canv bind $t <1> {selcanvline {} %x %y}
-    set rmx [llength [tsv::lindex rowidlist $curview $row]]
+    set rmx [llength [getrowids $row]]
     set olds [tsv::get parents$curview $id]
     if {$olds ne {}} {
-	set nextids [tsv::lindex rowidlist $curview [expr {$row + 1}]]
+	set nextids [getrowids [expr {$row + 1}]]
 	foreach p $olds {
 	    set i [lsearch -exact $nextids $p]
 	    if {$i > $rmx} {
@@ -3410,7 +3636,7 @@ proc drawcmittext {id row col} {
     set xt [xc $row $rmx]
     set rowtextx($row) $xt
     set idpos($id) [list $x $xt $y]
-    if {[info exists idtags($id)] || [info exists idheads($id)]
+    if {[tsv::exists idtags $id] || [tsv::exists idheads $id]
 	|| [info exists idotherrefs($id)]} {
 	set xt [drawtags $id $x $xt $y]
     }
@@ -3443,17 +3669,11 @@ proc drawcmittext {id row col} {
     }
 }
 
-proc drawcmitrow {row} {
-    global curview
-    global iddrawn
-    global numcommits
+proc askhighlights {row id} {
     global filehighlight fhighlights findstring nhighlights
     global hlview vhighlights
     global highlight_related rhighlights
 
-    if {$row >= $numcommits} return
-
-    set id [tsv::lindex vdisporder $curview $row]
     if {[info exists hlview] && ![info exists vhighlights($row)]} {
 	askvhighlight $row $id
     }
@@ -3466,8 +3686,12 @@ proc drawcmitrow {row} {
     if {$highlight_related ne "None" && ![info exists rhighlights($row)]} {
 	askrelhighlight $row $id
     }
-    if {[info exists iddrawn($id)]} return
-    set col [lsearch -exact [tsv::lindex rowidlist $curview $row] $id]
+}
+
+proc drawcmitrow {row id} {
+    global curview
+
+    set col [idcolumn $row $id]
     if {$col < 0} {
 	puts "oops, row $row id $id not in list"
 	return
@@ -3477,7 +3701,6 @@ proc drawcmitrow {row} {
     }
     assigncolor $id
     drawcmittext $id $row $col
-    set iddrawn($id) 1
 }
 
 proc drawcommits {row {endrow {}}} {
@@ -3495,22 +3718,24 @@ proc drawcommits {row {endrow {}}} {
 
     # make the lines join to already-drawn rows either side
     set r [expr {$row - 1}]
-    if {$r < 0 || ![info exists iddrawn([tsv::lindex vdisporder $curview $r])]} {
+    if {$r < 0 || ![info exists iddrawn([tsv::lindex disporder $curview $r])]} {
 	set r $row
     }
     set er [expr {$endrow + 1}]
     if {$er >= $numcommits ||
-	![info exists iddrawn([tsv::lindex vdisporder $curview $er])]} {
+	![info exists iddrawn([tsv::lindex disporder $curview $er])]} {
 	set er $endrow
     }
     for {} {$r <= $er} {incr r} {
-	set id [tsv::lindex vdisporder $curview $r]
+	set id [tsv::lindex disporder $curview $r]
+	askhighlights $r $id
 	set wasdrawn [info exists iddrawn($id)]
 	if {!$wasdrawn} {
-	    drawcmitrow $r
+	    drawcmitrow $r $id
+	    set iddrawn($id) 1
 	}
 	if {$r == $er} break
-	set nextid [tsv::lindex vdisporder $curview [expr {$r + 1}]]
+	set nextid [tsv::lindex disporder $curview [expr {$r + 1}]]
 	if {$wasdrawn && [info exists iddrawn($nextid)]} {
 	    catch {unset prevlines}
 	    continue
@@ -3522,7 +3747,7 @@ proc drawcommits {row {endrow {}}} {
 		unset prevlines($lid)
 	    }
 	}
-	set rowids [tsv::lindex rowidlist $curview $r]
+	set rowids [getrowids $r]
 	foreach lid $rowids {
 	    if {$lid eq {}} continue
 	    if {$lid eq $id} {
@@ -3575,7 +3800,7 @@ proc clear_display {} {
 }
 
 proc findcrossings {id} {
-    global curview numcommits rowoffsets
+    global curview numcommits
 
     set cross {}
     set ccross {}
@@ -3585,16 +3810,16 @@ proc findcrossings {id} {
 	}
 	if {$e <= $s} continue
 	for {set row $e} {[incr row -1] >= $s} {} {
-	    set x [lsearch -exact [tsv::lindex rowidlist $curview $row] $id]
+	    set x [idcolumn $row $id]
 	    if {$x < 0} {
 		puts "findcrossings: oops, no [shortids $id] in row $row"
 		break
 	    }
-	    set kid [tsv::lindex vdisporder $curview $row]
+	    set kid [tsv::lindex disporder $curview $row]
 	    set olds [tsv::get parents$curview $kid]
-	    set kidx [lsearch -exact [tsv::lindex rowidlist $curview $row] $kid]
+	    set kidx [idcolumn $row $kid]
 	    if {$kidx < 0} continue
-	    set nextrow [tsv::lindex rowidlist $curview [expr {$row + 1}]]
+	    set nextrow [getrowids [expr {$row + 1}]]
 	    foreach p $olds {
 		set px [lsearch -exact $nextrow $p]
 		if {$px < 0} continue
@@ -3618,54 +3843,57 @@ proc assigncolor {id} {
 
     if {[info exists colormap($id)]} return
     set ncolors [llength $colors]
-    set kids {}
-    if {[tsv::exists children$curview $id]} {
-	foreach child [tsv::get children$curview $id] {
-	    if {[tsv::exists ctok$curview $child]} {
-		lappend kids $child
-	    }
-	}
-    }
-    if {[llength $kids] == 1} {
-	set child [lindex $kids 0]
-	if {[info exists colormap($child)]
-	    && [llength [tsv::get parents$curview $child]] == 1} {
-	    set colormap($id) $colormap($child)
-	    return
-	}
-    }
     set badcolors {}
-    set origbad {}
-    foreach x [findcrossings $id] {
-	if {$x eq {}} {
-	    # delimiter between corner crossings and other crossings
-	    if {[llength $badcolors] >= $ncolors - 1} break
-	    set origbad $badcolors
-	}
-	if {[info exists colormap($x)]
-	    && [lsearch -exact $badcolors $colormap($x)] < 0} {
-	    lappend badcolors $colormap($x)
-	}
-    }
-    if {[llength $badcolors] >= $ncolors} {
-	set badcolors $origbad
-    }
-    set origbad $badcolors
-    if {[llength $badcolors] < $ncolors - 1} {
-	foreach child $kids {
-	    if {[info exists colormap($child)]
-		&& [lsearch -exact $badcolors $colormap($child)] < 0} {
-		lappend badcolors $colormap($child)
-	    }
-	    foreach p [tsv::get parents$curview $child] {
-		if {[info exists colormap($p)]
-		    && [lsearch -exact $badcolors $colormap($p)] < 0} {
-		    lappend badcolors $colormap($p)
+    if {0} {
+	set kids {}
+	if {[tsv::exists children$curview $id]} {
+	    foreach child [tsv::get children$curview $id] {
+		if {[tsv::exists ctok$curview $child]} {
+		    lappend kids $child
 		}
+	    }
+	}
+	if {[llength $kids] == 1} {
+	    set child [lindex $kids 0]
+	    if {[info exists colormap($child)]
+		&& [llength [tsv::get parents$curview $child]] == 1} {
+		set colormap($id) $colormap($child)
+		return
+	    }
+	}
+	set badcolors {}
+	set origbad {}
+	foreach x [findcrossings $id] {
+	    if {$x eq {}} {
+		# delimiter between corner crossings and other crossings
+		if {[llength $badcolors] >= $ncolors - 1} break
+		set origbad $badcolors
+	    }
+	    if {[info exists colormap($x)]
+		&& [lsearch -exact $badcolors $colormap($x)] < 0} {
+		lappend badcolors $colormap($x)
 	    }
 	}
 	if {[llength $badcolors] >= $ncolors} {
 	    set badcolors $origbad
+	}
+	set origbad $badcolors
+	if {[llength $badcolors] < $ncolors - 1} {
+	    foreach child $kids {
+		if {[info exists colormap($child)]
+		    && [lsearch -exact $badcolors $colormap($child)] < 0} {
+		    lappend badcolors $colormap($child)
+		}
+		foreach p [tsv::get parents$curview $child] {
+		    if {[info exists colormap($p)]
+			&& [lsearch -exact $badcolors $colormap($p)] < 0} {
+			lappend badcolors $colormap($p)
+		    }
+		}
+	    }
+	    if {[llength $badcolors] >= $ncolors} {
+		set badcolors $origbad
+	    }
 	}
     }
     for {set i 0} {$i <= $ncolors} {incr i} {
@@ -3688,20 +3916,20 @@ proc bindline {t id} {
 }
 
 proc drawtags {id x xt y1} {
-    global idtags idheads idotherrefs mainhead
+    global idotherrefs mainhead
     global linespc lthickness
     global canv mainfont rowtextx curview fgcolor bgcolor
 
     set marks {}
     set ntags 0
     set nheads 0
-    if {[info exists idtags($id)]} {
-	set marks $idtags($id)
+    if {[tsv::exists idtags $id]} {
+	set marks [tsv::get idtags $id]
 	set ntags [llength $marks]
     }
-    if {[info exists idheads($id)]} {
-	set marks [concat $marks $idheads($id)]
-	set nheads [llength $idheads($id)]
+    if {[tsv::exists idheads $id]} {
+	set marks [concat $marks [tsv::get idheads $id]]
+	set nheads [tsv::llength idheads $id]
     }
     if {[info exists idotherrefs($id)]} {
 	set marks [concat $marks $idotherrefs($id)]
@@ -3844,84 +4072,63 @@ proc tokenbefore {view row} {
 # on that row and below will move down one row.
 proc insertrow {row newcmit} {
     global phase
-    global curview rowoffsets numcommits
-    global rowlaidout rowoptim numcommits idrowranges
-    global selectedline rowchk commitidx curview
+    global curview numcommits
+    global selectedline curview
 
     if {$row >= $numcommits} {
 	puts "oops, inserting new row $row but only have $numcommits rows"
 	return
     }
-    set p [tsv::lindex vdisporder $curview $row]
+    set p [tsv::lindex disporder $curview $row]
     set newtok [tokenbefore $curview $row]
-    tsv::lpush vdisporder $curview $newcmit $row
+    tsv::lpush disporder $curview $newcmit $row
     tsv::set parents$curview $newcmit $p
     set kids [tsv::lappend children$curview $p $newcmit]
     tsv::set children$curview $newcmit {}
     tsv::lpush vcmitlisted $curview 1 $row
     tsv::set ctok$curview $newcmit $newtok
     tsv::lpush vtokenlist $curview $newtok $row
-    incr commitidx($curview)
 
-    set idlist [tsv::lindex rowidlist $curview $row]
-    set offs [lindex $rowoffsets $row]
-    set newoffs {}
-    foreach x $idlist {
-	if {$x eq {} || ($x eq $p && [llength $kids] == 1)} {
-	    lappend newoffs {}
-	} else {
-	    lappend newoffs 0
-	}
-    }
+    set idlist [getrowids $row]
     if {[llength $kids] == 1} {
 	set col [lsearch -exact $idlist $p]
 	lset idlist $col $newcmit
     } else {
 	set col [llength $idlist]
 	lappend idlist $newcmit
-	lappend offs {}
-	lset rowoffsets $row $offs
-    }
-    tsv::lpush rowidlist $curview $idlist $row
-    if {$phase ne {}} {
-	set rowoffsets [linsert $rowoffsets [expr {$row+1}] $newoffs]
     }
 
     if {[llength $kids] > 1} {
-	set ranges $idrowranges($curview,$p)
+	set ranges [tsv::get idrowranges$curview $p]
 	if {$ranges eq {}} {
 	    set ranges [list $newcmit $p]
 	} elseif {[lindex $ranges end-1] eq $p} {
 	    lset ranges end-1 $newcmit
 	}
-	set idrowranges($curview,$p) $ranges
+	tsv::set idrowranges$curview $p $ranges
     }
 
-    catch {unset rowchk}
-
-    incr rowlaidout
-    incr rowoptim
+    adjust_layout $row 1 $idlist
     incr numcommits
-
     if {[info exists selectedline] && $selectedline >= $row} {
 	incr selectedline
     }
+
     redisplay
 }
 
 # Remove a commit that was inserted with insertrow on row $row.
 proc removerow {row} {
     global phase
-    global curview rowoffsets numcommits
-    global idrowranges rowlaidout rowoptim numcommits
-    global selectedline rowchk commitidx
+    global curview numcommits
+    global selectedline
 
     if {$row >= $numcommits} {
 	puts "oops, removing row $row but only have $numcommits rows"
 	return
     }
     set rp1 [expr {$row + 1}]
-    set id [tsv::lpop vdisporder $curview $row]
+    set id [tsv::lpop disporder $curview $row]
     set p [tsv::get parents$curview $id]
     tsv::unset parents$curview $id
     tsv::lpop vcmitlisted $curview $row
@@ -3933,33 +4140,20 @@ proc removerow {row} {
     }
     set nkids [tsv::llength children$curview $p]
     tsv::unset children$curview $id
-    incr commitidx($curview) -1
 
-    tsv::lpop rowidlist $curview $row
-    if {$phase ne {}} {
-	set rowoffsets [lreplace $rowoffsets $rp1 $rp1]
-	if {$nkids > 0} {
-	    set offs [lindex $rowoffsets $row]
-	    set offs [lreplace $offs end end]
-	    lset rowoffsets $row $offs
-	}
-    }
     if {$nkids > 0} {
-	set ranges $idrowranges($curview,$p)
+	set ranges [tsv::get idrowranges$curview $p]
 	if {[lindex $ranges end-1] eq $id} {
-	    set idrowranges($curview,$p) [lreplace $ranges end-1 end]
+	    tsv::set idrowranges$curview $p [lreplace $ranges end-1 end]
 	}
     }
 
-    catch {unset rowchk}
-
-    incr rowlaidout -1
-    incr rowoptim -1
+    adjust_layout $row -1 {}
     incr numcommits -1
-
     if {[info exists selectedline] && $selectedline > $row} {
 	incr selectedline -1
     }
+
     redisplay
 }
 
@@ -4043,7 +4237,7 @@ proc dofind {} {
     set didsel 0
     set fldtypes {Headline Author Date Committer CDate Comments}
     set l -1
-    foreach id [tsv::get vdisporder $curview] {
+    foreach id [tsv::get disporder $curview] {
 	set d [tsv::get cdata $id]
 	incr l
 	if {$findtype == "Regexp"} {
@@ -4305,20 +4499,16 @@ proc appendrefs {pos tags var} {
 }
 
 proc taglist {ids} {
-    global idtags
-
     set tags {}
     foreach id $ids {
-	foreach tag $idtags($id) {
-	    lappend tags $tag
-	}
+	set tags [concat $tags [tsv::get idtags $id]]
     }
     return $tags
 }
 
 # called when we have finished computing the nearby tags
 proc dispneartags {} {
-    global selectedline currentid ctext anc_tags desc_tags showneartags
+    global selectedline currentid ctext showneartags
 
     if {![info exists selectedline] || !$showneartags} return
     set id $currentid
@@ -4328,11 +4518,11 @@ proc dispneartags {} {
 	    $ctext insert "branch linestart +6c" "es"
 	}
     }
-    if {[info exists anc_tags($id)]} {
-	appendrefs follows [taglist $anc_tags($id)] tagids
+    if {[tsv::exists anc_tags $id]} {
+	appendrefs follows [taglist [tsv::get anc_tags $id]] tagids
     }
-    if {[info exists desc_tags($id)]} {
-	appendrefs precedes [taglist $desc_tags($id)] tagids
+    if {[tsv::exists desc_tags $id]} {
+	appendrefs precedes [taglist [tsv::get desc_tags $id]] tagids
     }
     $ctext conf -state disabled
 }
@@ -4342,9 +4532,9 @@ proc selectline {l isnew} {
     global linehtag linentag linedtag
     global canvy0 linespc curview
     global currentid sha1entry
-    global commentend idtags linknum
+    global commentend linknum
     global mergemax numcommits pending_select
-    global cmitmode desc_tags anc_tags showneartags allcommits
+    global cmitmode showneartags
 
     catch {unset pending_select}
     $canv delete hover
@@ -4407,7 +4597,7 @@ proc selectline {l isnew} {
 
     set selectedline $l
 
-    set id [tsv::lindex vdisporder $curview $l]
+    set id [tsv::lindex disporder $curview $l]
     set currentid $id
     $sha1entry delete 0 end
     $sha1entry insert 0 $id
@@ -4423,9 +4613,9 @@ proc selectline {l isnew} {
     $ctext insert end "Author: [lindex $info 1]  $date\n"
     set date [formatdate [lindex $info 4]]
     $ctext insert end "Committer: [lindex $info 3]  $date\n"
-    if {[info exists idtags($id)]} {
+    if {[tsv::exists idtags $id]} {
 	$ctext insert end "Tags:"
-	foreach tag $idtags($id) {
+	foreach tag [tsv::get idtags $id] {
 	    $ctext insert end " $tag"
 	}
 	$ctext insert end "\n"
@@ -4458,9 +4648,7 @@ proc selectline {l isnew} {
     # make anything that looks like a SHA1 ID be a clickable link
     appendwithlinks $headers {}
     if {$showneartags} {
-	if {![info exists allcommits]} {
-	    getallcommits
-	}
+	getallcommits
 	$ctext insert end "Branch: \n"
 	$ctext mark set branch "end -2c"
 	if {[tsv::exists desc_heads $id]} {
@@ -4471,13 +4659,13 @@ proc selectline {l isnew} {
 	}
 	$ctext insert end "Follows: \n"
 	$ctext mark set follows "end -2c"
-	if {[info exists anc_tags($id)]} {
-	    appendrefs follows [taglist $anc_tags($id)] tagids
+	if {[tsv::exists anc_tags $id]} {
+	    appendrefs follows [taglist [tsv::get anc_tags $id]] tagids
 	}
 	$ctext insert end "Precedes: \n"
 	$ctext mark set precedes "end -2c"
-	if {[info exists desc_tags($id)]} {
-	    appendrefs precedes [taglist $desc_tags($id)] tagids
+	if {[tsv::exists desc_tags $id]} {
+	    appendrefs precedes [taglist [tsv::get desc_tags $id]] tagids
 	}
     }
     $ctext insert end "\n"
@@ -5173,7 +5361,7 @@ proc setcoords {} {
     global linespc charspc canvx0 canvy0 mainfont
     global xspc1 xspc2 lthickness
 
-    set linespc [font metrics $mainfont -linespace]
+    set linespc [expr {int([font metrics $mainfont -linespace] * 0.9)}]
     set charspc [font measure $mainfont "m"]
     set canvy0 [expr {int(3 + 0.5 * $linespc)}]
     set canvx0 [expr {int(3 + 0.5 * $linespc)}]
@@ -5201,7 +5389,7 @@ proc redisplay {} {
 
 proc incrfont {inc} {
     global mainfont textfont ctext canv phase
-    global stopped entries
+    global entries
     unmarkmatches
     set mainfont [lreplace $mainfont 1 1 [expr {[lindex $mainfont 1] + $inc}]]
     set textfont [lreplace $textfont 1 1 [expr {[lindex $textfont 1] + $inc}]]
@@ -5254,7 +5442,7 @@ proc gotocommit {} {
 	set id [string tolower $sha1string]
 	if {[regexp {^[0-9a-f]{4,39}$} $id]} {
 	    set matches {}
-	    foreach i [tsv::get vdisporder $curview] {
+	    foreach i [tsv::get disporder $curview] {
 		if {[string match $id* $i]} {
 		    lappend matches $i
 		}
@@ -5454,14 +5642,6 @@ proc selbyid {id} {
     }
 }
 
-proc mstime {} {
-    global startmstime
-    if {![info exists startmstime]} {
-	set startmstime [clock clicks -milliseconds]
-    }
-    return [format "%.3f" [expr {([clock click -milliseconds] - $startmstime) / 1000.0}]]
-}
-
 proc rowmenu {x y id} {
     global rowctxmenu selectedline rowmenuid curview
     global nullid fakerowmenu mainhead
@@ -5490,11 +5670,11 @@ proc diffvssel {dirn} {
 
     if {![info exists selectedline]} return
     if {$dirn} {
-	set oldid [tsv::lindex vdisporder $curview $selectedline]
+	set oldid [tsv::lindex disporder $curview $selectedline]
 	set newid $rowmenuid
     } else {
 	set oldid $rowmenuid
-	set newid [tsv::lindex vdisporder $curview $selectedline]
+	set newid [tsv::lindex disporder $curview $selectedline]
     }
     addtohistory [list doseldiff $oldid $newid]
     doseldiff $oldid $newid
@@ -5651,7 +5831,7 @@ proc mktag {} {
 }
 
 proc domktag {} {
-    global mktagtop env tagids idtags
+    global mktagtop env tagids
 
     set id [$mktagtop.sha1 get]
     set tag [$mktagtop.tag get]
@@ -5675,9 +5855,9 @@ proc domktag {} {
     }
 
     set tagids($tag) $id
-    lappend idtags($id) $tag
+    tsv::lpush idtags $id $tag end
     redrawtags $id
-    addedtag $id
+    do_allcomm addedtag $id
 }
 
 proc redrawtags {id} {
@@ -5796,8 +5976,6 @@ proc mkbranch {} {
 }
 
 proc mkbrgo {top} {
-    global headids idheads
-
     set name [$top.name get]
     set id [$top.sha1 get]
     if {$name eq {}} {
@@ -5821,8 +5999,7 @@ proc mkbrgo {top} {
 }
 
 proc cherrypick {} {
-    global rowmenuid curview
-    global mainhead anc_tags desc_tags allparents allchildren
+    global rowmenuid curview mainhead
 
     if {[tsv::exists desc_heads $rowmenuid]
 	&& [tsv::lsearch desc_heads $rowmenuid -exact $mainhead] >= 0} {
@@ -5846,13 +6023,7 @@ proc cherrypick {} {
 	error_popup "No changes committed"
 	return
     }
-    set allparents($newhead) $oldhead
-    lappend allchildren($oldhead) $newhead
-    tsv::set desc_heads $newhead $mainhead
-    if {[info exists anc_tags($oldhead)]} {
-	set anc_tags($newhead) $anc_tags($oldhead)
-    }
-    set desc_tags($newhead) {}
+    do_allcomm addcommit $newhead $oldhead $mainhead
     set row [rowofcommit $curview $oldhead]
     if {$row ne {}} {
 	insertrow $row $newhead
@@ -5867,7 +6038,6 @@ proc cherrypick {} {
 
 proc resethead {} {
     global mainheadid mainhead rowmenuid confirm_ok resettype
-    global showlocalchanges
 
     set confirm_ok 0
     set w ".confirmreset"
@@ -5909,7 +6079,7 @@ proc resethead {} {
 	redrawtags $oldhead
 	redrawtags $rowmenuid
     }
-    if {$showlocalchanges} {
+    if {[tsv::get options showlocalchanges]} {
 	doshowlocalchanges
     }
 }
@@ -5931,7 +6101,7 @@ proc headmenu {x y id head} {
 
 proc cobranch {} {
     global headmenuid headmenuhead mainhead headids
-    global showlocalchanges mainheadid
+    global mainheadid
 
     # check the tree is clean first??
     set oldmainhead $mainhead
@@ -5952,14 +6122,13 @@ proc cobranch {} {
 	}
 	redrawtags $headmenuid
     }
-    if {$showlocalchanges} {
+    if {[tsv::get options showlocalchanges]} {
 	dodiffindex
     }
 }
 
 proc rmbranch {} {
     global headmenuid headmenuhead mainhead
-    global headids idheads
 
     set head $headmenuhead
     set id $headmenuid
@@ -5985,378 +6154,405 @@ proc rmbranch {} {
     notbusy rmbranch
 }
 
-# Stuff for finding nearby tags
 proc getallcommits {} {
-    global allcstart allcommits allcfd allids
-
-    set allids {}
-    set fd [open [concat | git rev-list --all --topo-order --parents] r]
-    set allcfd $fd
-    fconfigure $fd -blocking 0
-    set allcommits "reading"
+    if {[tsv::exists allcommits {}]} return
+    tsv::set allcommits {} "reading"
+    do_allcomm readallcommits
     nowbusy allcommits
-    filerun $fd [list getallclines $fd]
-    set allcstart [clock clicks -milliseconds]
 }
 
 proc discardallcommits {} {
-    global allparents allchildren allcommits allcfd
-    global desc_tags anc_tags alldtags tagisdesc allids
-
-    if {![info exists allcommits]} return
-    if {$allcommits eq "reading"} {
-	catch {close $allcfd}
-    }
-    foreach v {allcommits allchildren allparents allids desc_tags anc_tags
-		alldtags tagisdesc} {
-	catch {unset $v}
-    }
-    tsv::unset desc_heads
+    if {![tsv::exists allcommits {}]} return
+    # XXX implement me
+    do_allcomm resetallcommits
 }
 
-proc combine_dtags {l1 l2} {
-    global tagisdesc notfirstd
-
-    set res [lsort -unique [concat $l1 $l2]]
-    for {set i 0} {$i < [llength $res]} {incr i} {
-	set x [lindex $res $i]
-	for {set j [expr {$i+1}]} {$j < [llength $res]} {} {
-	    set y [lindex $res $j]
-	    if {[info exists tagisdesc($x,$y)]} {
-		if {$tagisdesc($x,$y) > 0} {
-		    # x is a descendent of y, exclude x
-		    set res [lreplace $res $i $i]
-		    incr i -1
-		    break
-		} else {
-		    # y is a descendent of x, exclude y
-		    set res [lreplace $res $j $j]
-		}
-	    } else {
-		# no relation, keep going
-		incr j
-	    }
-	}
-    }
-    return $res
-}
-
-proc combine_atags {l1 l2} {
-    global tagisdesc
-
-    set res [lsort -unique [concat $l1 $l2]]
-    for {set i 0} {$i < [llength $res]} {incr i} {
-	set x [lindex $res $i]
-	for {set j [expr {$i+1}]} {$j < [llength $res]} {} {
-	    set y [lindex $res $j]
-	    if {[info exists tagisdesc($x,$y)]} {
-		if {$tagisdesc($x,$y) < 0} {
-		    # x is an ancestor of y, exclude x
-		    set res [lreplace $res $i $i]
-		    incr i -1
-		    break
-		} else {
-		    # y is an ancestor of x, exclude y
-		    set res [lreplace $res $j $j]
-		}
-	    } else {
-		# no relation, keep going
-		incr j
-	    }
-	}
-    }
-    return $res
-}
-
-proc forward_pass {id children} {
-    global idtags desc_tags idheads alldtags tagisdesc
-
-    set dtags {}
-    set dheads {}
-    foreach child $children {
-	if {[info exists idtags($child)]} {
-	    set ctags [list $child]
-	} else {
-	    set ctags $desc_tags($child)
-	}
-	if {$dtags eq {}} {
-	    set dtags $ctags
-	} elseif {$ctags ne $dtags} {
-	    set dtags [combine_dtags $dtags $ctags]
-	}
-	set cheads [tsv::get desc_heads $child]
-	if {$dheads eq {}} {
-	    set dheads $cheads
-	} elseif {$cheads ne $dheads} {
-	    set dheads [lsort -unique [concat $dheads $cheads]]
-	}
-    }
-    set desc_tags($id) $dtags
-    if {[info exists idtags($id)]} {
-	set adt $dtags
-	foreach tag $dtags {
-	    set adt [concat $adt $alldtags($tag)]
-	}
-	set adt [lsort -unique $adt]
-	set alldtags($id) $adt
-	foreach tag $adt {
-	    set tagisdesc($id,$tag) -1
-	    set tagisdesc($tag,$id) 1
-	}
-    }
-    if {[info exists idheads($id)]} {
-	set dheads [concat $dheads $idheads($id)]
-    }
-    tsv::set desc_heads $id $dheads
-}
-
-proc getallclines {fd} {
-    global allparents allchildren allcommits allcstart
-    global desc_tags idtags tagisdesc allids
-    global idheads travindex
-
-    set nc 0
-    while {[incr nc] <= 1000 && [gets $fd line] >= 0} {
-	set id [lindex $line 0]
-	lappend allids $id
-	set olds [lrange $line 1 end]
-	set allparents($id) $olds
-	if {![info exists allchildren($id)]} {
-	    set allchildren($id) {}
-	}
-	foreach p $olds {
-	    lappend allchildren($p) $id
-	}
-	# compute nearest tagged descendents as we go
-	# also compute descendent heads
-	forward_pass $id $allchildren($id)
-    }
-    if {[eof $fd]} {
-	set travindex [llength $allids]
-	set allcommits "traversing"
-	run restartatags
-	if {[catch {close $fd} err]} {
-	    error_popup "Error reading full commit graph: $err.\n\
-			 Results may be incomplete."
-	}
-	return 0
-    }
-    return [expr {$nc >= 1000? 2: 1}]
-}
-
-# walk backward through the tree and compute nearest tagged ancestors
-proc restartatags {} {
-    global allids allparents idtags anc_tags travindex
-
-    set i $travindex
-    set imin [expr {$i <= 1000? 0: $i - 1000}]
-    while {[incr i -1] >= $imin} {
-	set id [lindex $allids $i]
-	set atags {}
-	foreach p $allparents($id) {
-	    if {[info exists idtags($p)]} {
-		set ptags [list $p]
-	    } else {
-		set ptags $anc_tags($p)
-	    }
-	    if {$atags eq {}} {
-		set atags $ptags
-	    } elseif {$ptags ne $atags} {
-		set atags [combine_atags $atags $ptags]
-	    }
-	}
-	set anc_tags($id) $atags
-    }
-    set travindex [expr {$i+1}]
-    if {$i >= 0} {
-	return 1
-    }
-    set allcommits "done"
+proc allcommdone {} {
     notbusy allcommits
     dispneartags
-    return 0
-}
-
-# update the desc_tags and anc_tags arrays for a new tag just added
-proc addedtag {id} {
-    global desc_tags anc_tags allparents allchildren allcommits
-    global idtags tagisdesc alldtags
-
-    if {![info exists desc_tags($id)]} return
-    set adt $desc_tags($id)
-    foreach t $desc_tags($id) {
-	set adt [concat $adt $alldtags($t)]
-    }
-    set adt [lsort -unique $adt]
-    set alldtags($id) $adt
-    foreach t $adt {
-	set tagisdesc($id,$t) -1
-	set tagisdesc($t,$id) 1
-    }
-    if {[info exists anc_tags($id)]} {
-	set todo $anc_tags($id)
-	while {$todo ne {}} {
-	    set do [lindex $todo 0]
-	    set todo [lrange $todo 1 end]
-	    if {[info exists tagisdesc($id,$do)]} continue
-	    set tagisdesc($do,$id) -1
-	    set tagisdesc($id,$do) 1
-	    if {[info exists anc_tags($do)]} {
-		set todo [concat $todo $anc_tags($do)]
-	    }
-	}
-    }
-
-    set lastold $desc_tags($id)
-    set lastnew [list $id]
-    set nup 0
-    set nch 0
-    set todo $allparents($id)
-    while {$todo ne {}} {
-	set do [lindex $todo 0]
-	set todo [lrange $todo 1 end]
-	if {![info exists desc_tags($do)]} continue
-	if {$desc_tags($do) ne $lastold} {
-	    set lastold $desc_tags($do)
-	    set lastnew [combine_dtags $lastold [list $id]]
-	    incr nch
-	}
-	if {$lastold eq $lastnew} continue
-	set desc_tags($do) $lastnew
-	incr nup
-	if {![info exists idtags($do)]} {
-	    set todo [concat $todo $allparents($do)]
-	}
-    }
-
-    if {![info exists anc_tags($id)]} return
-    set lastold $anc_tags($id)
-    set lastnew [list $id]
-    set nup 0
-    set nch 0
-    set todo $allchildren($id)
-    while {$todo ne {}} {
-	set do [lindex $todo 0]
-	set todo [lrange $todo 1 end]
-	if {![info exists anc_tags($do)]} continue
-	if {$anc_tags($do) ne $lastold} {
-	    set lastold $anc_tags($do)
-	    set lastnew [combine_atags $lastold [list $id]]
-	    incr nch
-	}
-	if {$lastold eq $lastnew} continue
-	set anc_tags($do) $lastnew
-	incr nup
-	if {![info exists idtags($do)]} {
-	    set todo [concat $todo $allchildren($do)]
-	}
-    }
 }
 
 # update the desc_heads array for a new head just added
 proc addedhead {hid head} {
-    global allparents headids idheads
+    global allparents headids
 
     set headids($head) $hid
-    lappend idheads($hid) $head
-
-    set todo [list $hid]
-    while {$todo ne {}} {
-	set do [lindex $todo 0]
-	set todo [lrange $todo 1 end]
-	if {![tsv::exists desc_heads $do] ||
-	    [tsv::lsearch desc_heads $do -exact $head] >= 0} continue
-	set oldheads [tsv::get desc_heads $do]
-	set heads [tsv::lappend desc_heads $do $head]
-	while {1} {
-	    set p $allparents($do)
-	    if {[llength $p] != 1 || ![tsv::exists desc_heads $p] ||
-		[tsv::get desc_heads $p] ne $oldheads} break
-	    set do $p
-	    tsv::set desc_heads $do $heads
-	}
-	set todo [concat $todo $p]
-    }
+    tsv::lpush idheads $hid $head end
+    do_allcomm adjust_desc_heads $hid $head 1
 }
 
-# update the desc_heads array for a head just removed
+# update desc_heads for a head being removed
 proc removedhead {hid head} {
-    global allparents headids idheads
+    global headids
 
     unset headids($head)
-    if {$idheads($hid) eq $head} {
-	unset idheads($hid)
+    set ids [tsv::get idheads $hid]
+    if {$ids eq $head} {
+	tsv::unset idheads $hid
     } else {
-	set i [lsearch -exact $idheads($hid) $head]
+	set i [lsearch -exact $ids $head]
 	if {$i >= 0} {
-	    set idheads($hid) [lreplace $idheads($hid) $i $i]
+	    tsv::set idheads $hid [lreplace $ids $i $i]
 	}
     }
-
-    set todo [list $hid]
-    while {$todo ne {}} {
-	set do [lindex $todo 0]
-	set todo [lrange $todo 1 end]
-	if {![tsv::exists desc_heads $do]} continue
-	set i [tsv::lsearch desc_heads $do -exact $head]
-	if {$i < 0} continue
-	set oldheads [tsv::get desc_heads $do]
-	set heads [lreplace [tsv::get desc_heads $do] $i $i]
-	while {1} {
-	    tsv::set desc_heads $do $heads
-	    set p $allparents($do)
-	    if {[llength $p] != 1 || ![tsv::exists desc_heads $p] ||
-		[tsv::get desc_heads $p] ne $oldheads} break
-	    set do $p
-	}
-	set todo [concat $todo $p]
-    }
+    do_allcomm adjust_desc_heads $hid $head 0
 }
 
 # update things for a head moved to a child of its previous location
 proc movedhead {id name} {
-    global headids idheads
+    global headids
 
     set oldid $headids($name)
     set headids($name) $id
-    if {$idheads($oldid) eq $name} {
-	unset idheads($oldid)
+    set ids [tsv::get idheads $oldid]
+    if {$ids eq $name} {
+	tsv::unset idheads $oldid
     } else {
-	set i [lsearch -exact $idheads($oldid) $name]
+	set i [lsearch -exact $ids $name]
 	if {$i >= 0} {
-	    set idheads($oldid) [lreplace $idheads($oldid) $i $i]
+	    tsv::set idheads $oldid [lreplace $ids $i $i]
 	}
     }
-    lappend idheads($id) $name
+    tsv::lpush idheads $id $name
 }
 
-proc changedrefs {} {
-    global desc_tags anc_tags allcommits allids
-    global allchildren allparents idtags travindex
-
-    if {![info exists allcommits]} return
-    tsv::unset desc_heads
-    catch {unset desc_tags}
-    catch {unset anc_tags}
-    catch {unset alldtags}
-    catch {unset tagisdesc}
-    foreach id $allids {
-	forward_pass $id $allchildren($id)
+# Stuff for finding nearby tags
+set athreadstuff {
+    proc gset {var val} {
+	global $var
+	set $var $val
     }
-    if {$allcommits ne "reading"} {
-	set travindex [llength $allids]
-	if {$allcommits ne "traversing"} {
+
+    proc readallcommits {} {
+	global allcstart allcommits allcfd allids
+
+	set allids {}
+	set fd [open [concat | git rev-list --all --topo-order --parents] r]
+	set allcfd $fd
+	fconfigure $fd -blocking 0
+	filerun $fd [list getallclines $fd]
+	set allcstart [clock clicks -milliseconds]
+    }
+
+    proc resetallcommits {} {
+	global allparents allchildren allcommits allcfd
+	global desc_tags anc_tags alldtags tagisdesc allids
+	global desc_heads
+
+	if {![tsv::exists allcommits {}]} return
+	if {[tsv::get allcommits {}] eq "reading"} {
+	    catch {close $allcfd}
+	}
+	foreach v {allchildren allparents allids desc_tags anc_tags
+	    desc_heads alldtags tagisdesc} {
+	    catch {unset $v}
+	}
+	tsv::unset allcommits
+    }
+
+    proc combine_dtags {l1 l2} {
+	global tagisdesc notfirstd
+
+	set res [lsort -unique [concat $l1 $l2]]
+	for {set i 0} {$i < [llength $res]} {incr i} {
+	    set x [lindex $res $i]
+	    for {set j [expr {$i+1}]} {$j < [llength $res]} {} {
+		set y [lindex $res $j]
+		if {[info exists tagisdesc($x,$y)]} {
+		    if {$tagisdesc($x,$y) > 0} {
+			# x is a descendent of y, exclude x
+			set res [lreplace $res $i $i]
+			incr i -1
+			break
+		    } else {
+			# y is a descendent of x, exclude y
+			set res [lreplace $res $j $j]
+		    }
+		} else {
+		    # no relation, keep going
+		    incr j
+		}
+	    }
+	}
+	return $res
+    }
+
+    proc combine_atags {l1 l2} {
+	global tagisdesc
+
+	set res [lsort -unique [concat $l1 $l2]]
+	for {set i 0} {$i < [llength $res]} {incr i} {
+	    set x [lindex $res $i]
+	    for {set j [expr {$i+1}]} {$j < [llength $res]} {} {
+		set y [lindex $res $j]
+		if {[info exists tagisdesc($x,$y)]} {
+		    if {$tagisdesc($x,$y) < 0} {
+			# x is an ancestor of y, exclude x
+			set res [lreplace $res $i $i]
+			incr i -1
+			break
+		    } else {
+			# y is an ancestor of x, exclude y
+			set res [lreplace $res $j $j]
+		    }
+		} else {
+		    # no relation, keep going
+		    incr j
+		}
+	    }
+	}
+	return $res
+    }
+
+    proc forward_pass {id children} {
+	global desc_tags alldtags tagisdesc desc_heads
+	%ifnotthread% global idtags idheads
+
+	set dtags {}
+	set dheads {}
+	foreach child $children {
+	    if {[%tsvexists% idtags $child]} {
+		set ctags [list $child]
+	    } else {
+		set ctags $desc_tags($child)
+	    }
+	    if {$dtags eq {}} {
+		set dtags $ctags
+	    } elseif {$ctags ne $dtags} {
+		set dtags [combine_dtags $dtags $ctags]
+	    }
+	    set cheads $desc_heads($child)
+	    if {$dheads eq {}} {
+		set dheads $cheads
+	    } elseif {$cheads ne $dheads} {
+		set dheads [lsort -unique [concat $dheads $cheads]]
+	    }
+	}
+	set desc_tags($id) $dtags
+	%ifathread% tsv::set desc_tags $id $dtags
+	if {[%tsvexists% idtags $id]} {
+	    set adt $dtags
+	    foreach tag $dtags {
+		set adt [concat $adt $alldtags($tag)]
+	    }
+	    set adt [lsort -unique $adt]
+	    set alldtags($id) $adt
+	    foreach tag $adt {
+		set tagisdesc($id,$tag) -1
+		set tagisdesc($tag,$id) 1
+	    }
+	}
+	if {[%tsvexists% idheads $id]} {
+	    set dheads [concat $dheads [%tsvget% idheads $id]]
+	}
+	set desc_heads($id) $dheads
+	%ifathread% tsv::set desc_heads $id $dheads
+    }
+
+    proc getallclines {fd} {
+	global allparents allchildren allcstart allids travindex
+
+	set nc 0
+	while {[incr nc] <= 1000 && [gets $fd line] >= 0} {
+	    set id [lindex $line 0]
+	    lappend allids $id
+	    set olds [lrange $line 1 end]
+	    set allparents($id) $olds
+	    if {![info exists allchildren($id)]} {
+		set allchildren($id) {}
+	    }
+	    foreach p $olds {
+		lappend allchildren($p) $id
+	    }
+	    # compute nearest tagged descendents as we go
+	    # also compute descendent heads
+	    forward_pass $id $allchildren($id)
+	}
+	if {[eof $fd]} {
+	    set travindex [llength $allids]
 	    set allcommits "traversing"
 	    run restartatags
+	    if {[catch {close $fd} err]} {
+		do_main error_popup "Error reading full commit graph: $err.\n\
+			 Results may be incomplete."
+	    }
+	    return 0
 	}
+	return [expr {$nc >= 1000? 2: 1}]
+    }
+
+    # walk backward through the tree and compute nearest tagged ancestors
+    proc restartatags {} {
+	global allids allparents anc_tags travindex
+	%ifnotthread% global idtags
+
+	set i $travindex
+	set imin [expr {$i <= 1000? 0: $i - 1000}]
+	while {[incr i -1] >= $imin} {
+	    set id [lindex $allids $i]
+	    set atags {}
+	    foreach p $allparents($id) {
+		if {[%tsvexists% idtags $p]} {
+		    set ptags [list $p]
+		} else {
+		    if {![info exists anc_tags($p)]} {
+			puts "oops no anc_tags for [shortids $p] at [lsearch -exact -all $allids $p]"
+			puts "  i=$i/[llength $allids] id=[shortids $id] parents={[shortids $allparents($id)]}"
+			set ptags {}
+		    } else {
+			set ptags $anc_tags($p)
+		    }
+		}
+		if {$atags eq {}} {
+		    set atags $ptags
+		} elseif {$ptags ne $atags} {
+		    set atags [combine_atags $atags $ptags]
+		}
+	    }
+	    set anc_tags($id) $atags
+	    %ifathread% tsv::set anc_tags $id $atags
+	}
+	set travindex [expr {$i+1}]
+	if {$i >= 0} {
+	    return 1
+	}
+	tsv::set allcommits {} "done"
+	#global allcstart
+	#puts "took [expr {[clock clicks -milliseconds] - $allcstart}]ms to read all commits"
+	do_main allcommdone
+	return 0
+    }
+
+    # update the desc_tags and anc_tags arrays for a new tag just added
+    proc addedtag {id} {
+	global desc_tags anc_tags allparents allchildren allcommits
+	global tagisdesc alldtags
+	%ifnotthread% global idtags
+
+	if {![info exists desc_tags($id)]} return
+	set adt $desc_tags($id)
+	foreach t $desc_tags($id) {
+	    set adt [concat $adt $alldtags($t)]
+	}
+	set adt [lsort -unique $adt]
+	set alldtags($id) $adt
+	foreach t $adt {
+	    set tagisdesc($id,$t) -1
+	    set tagisdesc($t,$id) 1
+	}
+	if {[info exists anc_tags($id)]} {
+	    set todo $anc_tags($id)
+	    while {$todo ne {}} {
+		set do [lindex $todo 0]
+		set todo [lrange $todo 1 end]
+		if {[info exists tagisdesc($id,$do)]} continue
+		set tagisdesc($do,$id) -1
+		set tagisdesc($id,$do) 1
+		if {[info exists anc_tags($do)]} {
+		    set todo [concat $todo $anc_tags($do)]
+		}
+	    }
+	}
+
+	set lastold $desc_tags($id)
+	set lastnew [list $id]
+	set nup 0
+	set nch 0
+	set todo $allparents($id)
+	while {$todo ne {}} {
+	    set do [lindex $todo 0]
+	    set todo [lrange $todo 1 end]
+	    if {![info exists desc_tags($do)]} continue
+	    if {$desc_tags($do) ne $lastold} {
+		set lastold $desc_tags($do)
+		set lastnew [combine_dtags $lastold [list $id]]
+		incr nch
+	    }
+	    if {$lastold eq $lastnew} continue
+	    set desc_tags($do) $lastnew
+	    %ifathread% tsv::set desc_tags $do $lastnew
+	    incr nup
+	    if {![%tsvexists% idtags $do]} {
+		set todo [concat $todo $allparents($do)]
+	    }
+	}
+
+	if {![info exists anc_tags($id)]} return
+	set lastold $anc_tags($id)
+	set lastnew [list $id]
+	set nup 0
+	set nch 0
+	set todo $allchildren($id)
+	while {$todo ne {}} {
+	    set do [lindex $todo 0]
+	    set todo [lrange $todo 1 end]
+	    if {![info exists anc_tags($do)]} continue
+	    if {$anc_tags($do) ne $lastold} {
+		set lastold $anc_tags($do)
+		set lastnew [combine_atags $lastold [list $id]]
+		incr nch
+	    }
+	    if {$lastold eq $lastnew} continue
+	    set anc_tags($do) $lastnew
+	    %ifathread% tsv::set anc_tags $do $lastnew
+	    incr nup
+	    if {![%tsvexists% idtags $do]} {
+		set todo [concat $todo $allchildren($do)]
+	    }
+	}
+    }
+
+    # update the desc_heads array for a head just removed
+    proc adjust_desc_heads {hid head added} {
+	global allparents desc_heads
+
+	set todo [list $hid]
+	while {$todo ne {}} {
+	    set do [lindex $todo 0]
+	    set todo [lrange $todo 1 end]
+	    if {![info exists desc_heads($do)]} continue
+	    set oldheads $desc_heads($do)
+	    set i [lsearch -exact $oldheads $head]
+	    if {$added} {
+		if {$i >= 0} continue
+		set heads [linsert desc_heads($do) $head end]
+	    } else {
+		if {$i < 0} continue
+		set heads [lreplace $desc_heads($do) $i $i]
+	    }
+	    while {1} {
+		set desc_heads($do) $heads
+		%ifathread% tsv::set desc_heads $do $heads
+		set p $allparents($do)
+		if {[llength $p] != 1 || ![info exists desc_heads($p)] ||
+		    $desc_heads($p) ne $oldheads} break
+		set do $p
+	    }
+	    set todo [concat $todo $p]
+	}
+    }
+
+    proc addcommit {newhead oldhead mainhead} {
+	global allparents allchildren desc_heads desc_tags anc_tags
+
+	set allparents($newhead) $oldhead
+	lappend allchildren($oldhead) $newhead
+	set desc_heads($newhead) $mainhead
+	%ifathread% tsv::set desc_heads $newhead $mainhead
+	if {[info exists anc_tags($oldhead)]} {
+	    set anc_tags($newhead) $anc_tags($oldhead)
+	    %ifathread% tsv::set anc_tags $newhead $anc_tags($oldhead)
+	}
+	set desc_tags($newhead) {}
+	%ifathread% tsv::set desc_tags $newhead {}
     }
 }
 
 proc rereadrefs {} {
-    global idtags idheads idotherrefs mainhead
+    global idotherrefs mainhead
 
-    set refids [concat [array names idtags] \
-		    [array names idheads] [array names idotherrefs]]
+    set refids [concat [tsv::array names idtags] \
+		    [tsv::array names idheads] [array names idotherrefs]]
     foreach id $refids {
 	if {![info exists ref($id)]} {
 	    set ref($id) [listrefs $id]
@@ -6365,8 +6561,8 @@ proc rereadrefs {} {
     set oldmainhead $mainhead
     readrefs
     changedrefs
-    set refids [lsort -unique [concat $refids [array names idtags] \
-			[array names idheads] [array names idotherrefs]]]
+    set refids [lsort -unique [concat $refids [tsv::array names idtags] \
+			[tsv::array names idheads] [array names idotherrefs]]]
     foreach id $refids {
 	set v [listrefs $id]
 	if {![info exists ref($id)] || $ref($id) != $v ||
@@ -6378,15 +6574,15 @@ proc rereadrefs {} {
 }
 
 proc listrefs {id} {
-    global idtags idheads idotherrefs
+    global idotherrefs
 
     set x {}
-    if {[info exists idtags($id)]} {
-	set x $idtags($id)
+    if {[tsv::exists idtags $id]} {
+	set x [tsv::get idtags $id]
     }
     set y {}
-    if {[info exists idheads($id)]} {
-	set y $idheads($id)
+    if {[tsv::exists idheads $id]} {
+	set y [tsv::get idheads $id]
     }
     set z {}
     if {[info exists idotherrefs($id)]} {
@@ -6426,8 +6622,8 @@ proc doquit {} {
 }
 
 proc doprefs {} {
-    global maxwidth maxgraphpct diffopts
-    global oldprefs prefstop showneartags showlocalchanges
+    global maxgraphpct diffopts
+    global oldprefs prefstop showneartags
     global bgcolor fgcolor ctext diffcolors
 
     set top .gitkprefs
@@ -6436,8 +6632,12 @@ proc doprefs {} {
 	raise $top
 	return
     }
-    foreach v {maxwidth maxgraphpct diffopts showneartags showlocalchanges} {
+    foreach v {maxgraphpct diffopts showneartags} {
 	set oldprefs($v) [set $v]
+    }
+    foreach v {maxwidth showlocalchanges} {
+	global new$v
+	set new$v [tsv::get options $v]
     }
     toplevel $top
     wm title $top "Gitk preferences"
@@ -6446,7 +6646,7 @@ proc doprefs {} {
     label $top.spacer -text " "
     label $top.maxwidthl -text "Maximum graph width (lines)" \
 	-font optionfont
-    spinbox $top.maxwidth -from 0 -to 100 -width 4 -textvariable maxwidth
+    spinbox $top.maxwidth -from 0 -to 100 -width 4 -textvariable newmaxwidth
     grid $top.spacer $top.maxwidthl $top.maxwidth -sticky w
     label $top.maxpctl -text "Maximum graph width (% of pane)" \
 	-font optionfont
@@ -6454,7 +6654,7 @@ proc doprefs {} {
     grid x $top.maxpctl $top.maxpct -sticky w
     frame $top.showlocal
     label $top.showlocal.l -text "Show local changes" -font optionfont
-    checkbutton $top.showlocal.b -variable showlocalchanges
+    checkbutton $top.showlocal.b -variable newshowlocalchanges
     pack $top.showlocal.b $top.showlocal.l -side left
     grid x $top.showlocal -sticky w
 
@@ -6536,10 +6736,10 @@ proc setfg {c} {
 }
 
 proc prefscan {} {
-    global maxwidth maxgraphpct diffopts
-    global oldprefs prefstop showneartags showlocalchanges
+    global maxgraphpct diffopts
+    global oldprefs prefstop showneartags
 
-    foreach v {maxwidth maxgraphpct diffopts showneartags showlocalchanges} {
+    foreach v {maxgraphpct diffopts showneartags} {
 	set $v $oldprefs($v)
     }
     catch {destroy $prefstop}
@@ -6547,20 +6747,22 @@ proc prefscan {} {
 }
 
 proc prefsok {} {
-    global maxwidth maxgraphpct
-    global oldprefs prefstop showneartags showlocalchanges
+    global newmaxwidth maxgraphpct
+    global oldprefs prefstop showneartags newshowlocalchanges
 
     catch {destroy $prefstop}
     unset prefstop
-    if {$showlocalchanges != $oldprefs(showlocalchanges)} {
-	if {$showlocalchanges} {
+    if {[tsv::get options showlocalchanges] != $newshowlocalchanges} {
+	tsv::set options showlocalchanges $newshowlocalchanges
+	if {$newshowlocalchanges} {
 	    doshowlocalchanges
 	} else {
 	    dohidelocalchanges
 	}
     }
-    if {$maxwidth != $oldprefs(maxwidth)
+    if {[tsv::get options maxwidth] != $newmaxwidth
 	|| $maxgraphpct != $oldprefs(maxgraphpct)} {
+	tsv::set options maxwidth $newmaxwidth
 	redisplay
     } elseif {$showneartags != $oldprefs(showneartags)} {
 	reselectline
@@ -6847,6 +7049,107 @@ proc tcl_encoding {enc} {
     return {}
 }
 
+proc faketsv {} {
+    namespace eval tsv {
+	proc exists {a b} {
+	    global $a
+	    return [info exists $a\($b\)]
+	}
+	proc get {a b} {
+	    global $a
+	    return [::set $a\($b\)]
+	}
+	proc set {a b v} {
+	    global $a
+	    return [::set $a\($b\) $v]
+	}
+	proc unset {a {b {}}} {
+	    global $a
+	    if {$b eq {}} {
+		::unset $a
+	    } else {
+		::unset $a\($b\)
+	    }
+	}
+	proc array args {
+	    global [::lindex $args 1]
+	    return [eval ::array $args]
+	}
+	proc llength {a b} {
+	    global $a
+	    return [::llength [::set $a\($b\)]]
+	}
+	proc lindex {a b i} {
+	    global $a
+	    return [::lindex [::set $a\($b\)] $i]
+	}
+	proc lpush {a b v pos} {
+	    global $a
+	    if {![info exists $a\($b\)]} {
+		::set $a\($b\) [list $v]
+	    } elseif {$pos eq "end"} {
+		::lappend $a\($b\) $v
+	    } else {
+		::set $a\($b\) [::linsert [::set $a\($b\)] $pos $v]
+	    }
+	}
+	proc lpop {a b i} {
+	    global $a
+	    ::set v [::set $a\($b\)]
+	    ::set x [::lindex $v $i]
+	    ::set $a\($b\) [::lreplace $v $i $i]
+	    return $x
+	}
+	proc linsert args {
+	    ::set a [::lindex $args 0]
+	    ::set b [::lindex $args 1]
+	    global $a
+	    if {![info exists $a\($b\)]} {
+		::set $a\($b\) [::lrange $args 3 end]
+	    } else {
+		::set $a\($b\) [eval ::linsert \$$a\($b\) \
+				    [::lrange $args 2 end]]
+	    }
+	}
+	proc lsearch args {
+	    ::set a [::lindex $args 0]
+	    ::set b [::lindex $args 1]
+	    global $a
+	    ::set flags {}
+	    ::set args [::lrange $args 2 end]
+	    ::set arg [::lindex $args 0]
+	    if {[string match "-*" $arg]} {
+		::set args [::lrange $args 1 end]
+		::lappend flags $arg
+	    }
+	    return [eval ::lsearch $flags \$$a\($b\) $args]
+	}
+	proc lappend {a b v} {
+	    global $a
+	    return [::lappend $a\($b\) $v]
+	}
+    }
+}
+
+# initializers
+set nullid "0000000000000000000000000000000000000000"
+
+set history {}
+set historyindex 0
+set fh_serial 0
+set nhl_names {}
+set highlight_paths {}
+set searchdirn -forwards
+set boldrows {}
+set boldnamerows {}
+
+set stopped 0
+set stuffsaved 0
+set patchnum 0
+set lookingforhead 0
+set localrow -1
+set lserial 0
+
 # defaults...
 set datemode 0
 set diffopts "-U 5 -p"
@@ -6869,9 +7172,9 @@ set textfont {Courier 9}
 set uifont {Helvetica 9 bold}
 set findmergefiles 0
 set maxgraphpct 50
-set maxwidth 16
 set revlistorder 0
 set fastdate 0
+set maxwidth 16
 set uparrowlen 7
 set downarrowlen 7
 set mingaplen 30
@@ -6890,12 +7193,16 @@ set diffcolors {red "#00a000" blue}
 catch {source ~/.gitk}
 
 font create optionfont -family sans-serif -size -12
+setcoords
 
+# parse command-line arguments
+set nothread 0
 set revtreeargs {}
 foreach arg $argv {
-    switch -regexp -- $arg {
-	"^$" { }
-	"^-d" { set datemode 1 }
+    switch -- $arg {
+	"" { }
+	"-d" { set datemode 1 }
+	"--nothread" { set nothread 1 }
 	default {
 	    lappend revtreeargs $arg
 	}
@@ -6932,63 +7239,160 @@ if {$i >= 0} {
     }
 }
 
-set nullid "0000000000000000000000000000000000000000"
+if {!$nothread} {
+    if {[catch {package require Thread}]} {
+	set nothread 1
+    }
+}
 
-set runq {}
-set history {}
-set historyindex 0
-set fh_serial 0
-set nhl_names {}
-set highlight_paths {}
-set searchdirn -forwards
-set boldrows {}
-set boldnamerows {}
+if {$nothread} {
+    faketsv
 
-set optim_delay 16
-set reorder_delay 10
+    proc do_main args {
+	eval run $args
+    }
+
+    proc do_layout args {
+	eval $args
+    }
+
+    proc do_allcomm args {
+	eval $args
+    }
+
+    proc preproc {str map} {
+	set str [regsub -all {%tsvexists% *([a-z0-9_$]*) +([a-z0-9_$]*)} \
+		     $str {info exists \1\\(\2\\)}]
+	set str [regsub -all {%tsv[gs]et% *([a-z0-9_$]*) +([a-z0-9_$]*)} \
+		     $str {set \1\\(\2\\)}]
+	set str [regsub -all {%tsvsearch% *([a-z0-9_$]*) +([a-z0-9_$]*)} \
+		     $str {lsearch -exact [set \1\\(\2\\)]}]
+	set str [regsub -all {%tsvllength% *([a-z0-9_$]*) +([a-z0-9_$]*)} \
+		     $str {llength [set \1\\(\2\\)]}]
+	set str [regsub -all {%tsvlindex% *([a-z0-9_$]*) +([a-z0-9_$]*)} \
+		     $str {lindex [set \1\\(\2\\)]}]
+	set str [regsub -all {%tsvappend% *([a-z0-9_$]*) +([a-z0-9_$]*)} \
+		     $str {lappend \1\\(\2\\)}]
+	return [string map $map $str]
+    }
+
+    eval $mnotthreadstuff
+
+    set map {%iflthread% \# %ifnotlthread% {}
+	%ifmthread% \# %ifnotmthread% {}
+	%ifathread% \#
+	%ifnotthread% {}}
+
+    eval [preproc $lthreadstuff $map]
+    eval [preproc $commonstuff $map]
+    eval [preproc $athreadstuff $map]
+    eval [preproc $mstuff $map]
+
+} else {
+    set allthreadstuff {
+	proc gset {var val} {
+	    global $var
+	    set $var $val
+	}
+
+	proc do_main args {
+	    global mainthread
+	    thread::send -async $mainthread $args
+	}
+    }
+
+    proc do_layout args {
+	global layoutthread
+
+	thread::send -async $layoutthread $args
+    }
+
+    proc do_allcomm args {
+	global allcommthread
+
+	thread::send -async $allcommthread $args
+    }
+
+    proc preproc {str map} {
+	set str [regsub -all {%tsvsearch% *([a-z0-9_$]*) +([a-z0-9_$]*)} \
+		     $str {tsv::lsearch \1 \2 -exact}]
+	set str [regsub -all -line {%tsvappend%(.*)$} \
+		     $str {tsv::lpush \1 end}]
+	set str [regsub -all {%tsv([a-z]*)%} $str {tsv::\1}]
+	return [string map $map $str]
+    }
+
+    eval $mthreadstuff
+
+    set map_l {%iflthread% {} %ifnotlthread% \#
+	%ifmthread% \# %ifnotmthread% {}
+	%ifathread% \# %ifnotthread% \#}
+    set map_m {%iflthread% \# %ifnotlthread% {}
+	%ifmthread% {} %ifnotmthread% \#
+	%ifathread% \# %ifnotthread% \#}
+    set map_a {%iflthread% \# %ifnotlthread% {}
+	%ifmthread% \# %ifnotmthread% {}
+	%ifathread% {} %ifnotthread% \#}
+
+    set layoutthread [thread::create]
+    do_layout eval [preproc $commonstuff $map_l]
+    do_layout eval [preproc $lthreadstuff $map_l]
+    do_layout eval $allthreadstuff
+    do_layout gset mainthread [thread::id]
+    foreach v {datemode tclencoding} {
+	do_layout gset $v [set $v]
+    }
+
+    eval [preproc $commonstuff $map_m]
+    eval [preproc $mstuff $map_m]
+
+    set allcommthread [thread::create]
+    do_allcomm eval [preproc $commonstuff $map_a]
+    do_allcomm eval [preproc $athreadstuff $map_a]
+    do_allcomm eval $allthreadstuff
+    do_allcomm gset mainthread [thread::id]
+}
+
+tsv::set options maxwidth $maxwidth
+tsv::set options uparrowlen $uparrowlen
+tsv::set options downarrowlen $downarrowlen
+tsv::set options mingaplen $mingaplen
+tsv::set options showlocalchanges $showlocalchanges
+
+makewindow
 
 set nextviewnum 1
 set curview 0
 set selectedview 0
 set selectedhlview None
-set viewfiles(0) {}
+tsv::set viewfiles 0 {}
 set viewperm(0) 0
-set viewargs(0) {}
-
-set cmdlineok 0
-set stopped 0
-set stuffsaved 0
-set patchnum 0
-set lookingforhead 0
-set localrow -1
-set lserial 0
-setcoords
-makewindow
-readrefs
+tsv::set viewargs 0 {}
 
 if {$cmdline_files ne {} || $revtreeargs ne {}} {
     # create a view for the files/dirs specified on the command line
     set curview 1
     set selectedview 1
     set nextviewnum 2
-    set viewname(1) "Command line"
-    set viewfiles(1) $cmdline_files
-    set viewargs(1) $revtreeargs
+    tsv::set viewname 1 "Command line"
+    tsv::set viewfiles 1 $cmdline_files
+    tsv::set viewargs 1 $revtreeargs
     set viewperm(1) 0
     addviewmenu 1
-    .bar.view entryconf 2 -state normal
-    .bar.view entryconf 3 -state normal
+    .bar.view entryconf Edit* -state normal
+    .bar.view entryconf Delete* -state normal
 }
 
 if {[info exists permviews]} {
     foreach v $permviews {
 	set n $nextviewnum
 	incr nextviewnum
-	set viewname($n) [lindex $v 0]
-	set viewfiles($n) [lindex $v 1]
-	set viewargs($n) [lindex $v 2]
+	tsv::set viewname $n [lindex $v 0]
+	tsv::set viewfiles $n [lindex $v 1]
+	tsv::set viewargs $n [lindex $v 2]
 	set viewperm($n) 1
 	addviewmenu $n
     }
 }
-getcommits
+readrefs
+getcommits $curview
