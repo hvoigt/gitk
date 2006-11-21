@@ -639,6 +639,7 @@ set lthreadstuff {
 	set rowoptim 0
 	set lnumcommits 0
 	set rowidlist {{}}
+	%iflthread% tsv::set vrowidlist $curview {}
 	set rowoffsets {{}}
 	catch {unset idinlist}
 	catch {unset rowchk}
@@ -3408,6 +3409,10 @@ proc drawlineseg {id row endrow arrowlow} {
     }
     if {$le <= $row} {
 	return $row
+    }
+    if {$arrowhigh && [tsv::lsearch idrowranges$curview $id -exact \
+			   [tsv::lindex disporder $curview $le]] < 0} {
+	set arrowhigh 0
     }
 
     set lines {}
@@ -6248,6 +6253,9 @@ set athreadstuff {
 	    catch {unset $v}
 	}
 	tsv::unset allcommits
+	%ifathread% catch {tsv::unset desc_heads}
+	%ifathread% catch {tsv::unset desc_tags}
+	%ifathread% catch {tsv::unset anc_tags}
     }
 
     proc combine_dtags {l1 l2} {
