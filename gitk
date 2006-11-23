@@ -285,7 +285,8 @@ set lthreadstuff {
 	}
 	set commfd($view) $fd
 	set leftover($view) {}
-	fconfigure $fd -blocking 0 -translation lf
+	fconfigure $fd -translation lf
+	%ifnotthread% fconfigure $fd -blocking 0
 	if {$tclencoding != {}} {
 	    fconfigure $fd -encoding $tclencoding
 	}
@@ -6234,7 +6235,7 @@ set athreadstuff {
 	set allids {}
 	set fd [open [concat | git rev-list --all --topo-order --parents] r]
 	set allcfd $fd
-	fconfigure $fd -blocking 0
+	%ifnotthread% fconfigure $fd -blocking 0
 	filerun $fd [list getallclines $fd]
 	set allcstart [clock clicks -milliseconds]
     }
