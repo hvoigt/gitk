@@ -1406,7 +1406,7 @@ proc makewindow {} {
     pack .ctop.top.lbar.vlabel -side left -fill y
     global viewhlmenu selectedhlview
     set viewhlmenu [tk_optionMenu .ctop.top.lbar.vhl selectedhlview None]
-    $viewhlmenu entryconf 0 -command delvhighlight
+    $viewhlmenu entryconf None -command delvhighlight
     $viewhlmenu conf -font $uifont
     .ctop.top.lbar.vhl conf -font $uifont
     pack .ctop.top.lbar.vhl -side left -fill y
@@ -2340,7 +2340,7 @@ proc doviewmenu {m first cmd op argv} {
 proc allviewmenus {n op args} {
     global viewhlmenu
 
-    doviewmenu .bar.view 7 [list showview $n] $op $args
+    doviewmenu .bar.view 5 [list showview $n] $op $args
     doviewmenu $viewhlmenu 1 [list addvhighlight $n] $op $args
 }
 
@@ -2382,7 +2382,7 @@ proc newviewok {top n} {
 	set viewperm($n) $newviewperm($n)
 	if {$newviewname($n) ne [tsv::get viewname $n]} {
 	    tsv::set viewname $n $newviewname($n)
-	    doviewmenu .bar.view 7 [list showview $n] \
+	    doviewmenu .bar.view 5 [list showview $n] \
 		entryconf [list -label $newviewname($n)]
 	    doviewmenu $viewhlmenu 1 [list addvhighlight $n] \
 		entryconf [list -label $newviewname($n) \
@@ -2467,8 +2467,8 @@ proc showview {n} {
     }
 
     set selectedview $n
-    .bar.view entryconf 2 -state [expr {$n == 0? "disabled": "normal"}]
-    .bar.view entryconf 3 -state [expr {$n == 0? "disabled": "normal"}]
+    .bar.view entryconf Edit* -state [expr {$n == 0? "disabled": "normal"}]
+    .bar.view entryconf Delete* -state [expr {$n == 0? "disabled": "normal"}]
 
     if {$selid ne {}} {
 	set pending_select $selid
@@ -5661,13 +5661,13 @@ proc rowmenu {x y id} {
     }
     if {$id ne $nullid} {
 	set menu $rowctxmenu
-	$menu entryconfigure 7 -label "Reset $mainhead branch to here"
+	$menu entryconfigure Reset* -label "Reset $mainhead branch to here"
     } else {
 	set menu $fakerowmenu
     }
-    $menu entryconfigure 0 -state $state
-    $menu entryconfigure 1 -state $state
-    $menu entryconfigure 2 -state $state
+    $menu entryconfigure "Diff this*" -state $state
+    $menu entryconfigure "Diff selected*" -state $state
+    $menu entryconfigure "Make patch" -state $state
     tk_popup $menu $x $y
 }
 
