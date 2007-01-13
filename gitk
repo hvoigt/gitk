@@ -14,7 +14,7 @@ proc gitdir {} {
     if {[info exists env(GIT_DIR)]} {
 	return $env(GIT_DIR)
     } else {
-	return ".git"
+	return [exec git rev-parse --git-dir]
     }
 }
 
@@ -7369,6 +7369,7 @@ tsv::set options mingaplen $mingaplen
 tsv::set options showlocalchanges $showlocalchanges
 
 makewindow
+wm title . "[file tail $argv0]: [file tail [pwd]]"
 
 set nextviewnum 1
 set curview 0
