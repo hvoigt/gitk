@@ -6524,7 +6524,7 @@ set athreadstuff {
 	    set i [lsearch -exact $oldheads $head]
 	    if {$added} {
 		if {$i >= 0} continue
-		set heads [linsert desc_heads($do) $head end]
+		set heads [linsert desc_heads($do) end $head]
 	    } else {
 		if {$i < 0} continue
 		set heads [lreplace $desc_heads($do) $i $i]
